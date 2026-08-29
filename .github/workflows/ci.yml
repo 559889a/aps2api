@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt / clippy / test (linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install BoringSSL build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake perl nasm libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
+      - name: cargo test
+        run: cargo test
+
+  build-windows:
+    name: build (x86_64-pc-windows-msvc, debug artifact)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build
+        run: cargo build
+      - name: Upload debug artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aps2api-debug-x86_64-pc-windows-msvc
+          path: target/debug/aps2api.exe
+
+  build-linux:
+    name: build (x86_64-unknown-linux-gnu, debug artifact)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install BoringSSL build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake perl nasm libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build
+        run: cargo build
+      - name: Upload debug artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aps2api-debug-x86_64-unknown-linux-gnu
+          path: target/debug/aps2api
+
+  build-termux:
+    name: build (aarch64-linux-android, debug artifact)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install BoringSSL build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake perl ninja-build
+      - name: Set up NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo ndk build (aarch64, API 24+)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CC_aarch64_linux_android: aarch64-linux-android24-clang
+          CXX_aarch64_linux_android: aarch64-linux-android24-clang++
+          AR_aarch64_linux_android: llvm-ar
+        run: cargo ndk -t arm64-v8a -p 24 build
+      - name: Upload debug artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aps2api-debug-aarch64-linux-android
+          path: target/aarch64-linux-android/debug/aps2api

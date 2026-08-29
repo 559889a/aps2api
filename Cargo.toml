@@ -1,0 +1,47 @@
+[package]
+name = "aps2api"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Vertex Gemini 2api proxy: express + cookie dual upstream, OAI & Gemini native endpoints"
+license = "MIT"
+
+# Dependency pinning discipline (spec appendix C.2): exact versions locked on
+# development day one; every upgrade is a deliberate one-off decision.
+# Cargo.lock is committed and must travel with the source.
+[dependencies]
+tokio = { version = "=1.53.1", features = ["full"] }
+bytes = "=1.12.1"
+futures-util = "=0.3.34"
+axum = "=0.8.9"
+reqwest = { version = "=0.13.4", default-features = false, features = [
+    "rustls",
+    "http2",
+    "charset",
+    "json",
+    "stream",
+    "socks",
+] }
+wreq = { version = "=0.16.1", features = [
+    "stream",
+    "socks",
+    "gzip",
+    "brotli",
+    "zstd",
+    "deflate",
+    "json",
+] }
+wreq-util = "=0.2.0"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+serde_yaml = "=0.9.34"
+sha1 = "=0.11.0"
+uuid = { version = "=1.26.0", features = ["v4"] }
+base64 = "=0.23.1"
+rand = "=0.10.2"
+tracing = "=0.1.44"
+tracing-subscriber = "=0.3.23"
+chrono = { version = "=0.4.45", default-features = false, features = ["clock"] }
+
+[profile.release]
+strip = true

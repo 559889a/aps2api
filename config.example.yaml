@@ -1,0 +1,43 @@
+# aps2api example configuration — copy to config.yaml and fill in.
+# The binary reads config.yaml and model.json from its own directory.
+
+# ============ Local service ============
+api_key: ""                         # local auth key; clients send Authorization: Bearer <key> or x-goog-api-key header
+port: 8080                          # listen port (must be > 1024 on Android/Termux)
+
+# ============ Outbound proxy (commented out = direct connection) ============
+# socks5: "socks5://user:pass@host:port"   # embedded user:pass supported (authenticated SOCKS5).
+#                                          # Point this at a static residential exit and ALL upstream traffic
+#                                          # leaves from that IP regardless of the device's own network
+#                                          # (phone/Termux included — no extra VPN or chaining tools needed).
+#                                          # Plain "socks5://127.0.0.1:7890" (local chaining entry) and
+#                                          # socks5h:// are also accepted. Applies to both channels.
+
+# ============ Express channel (Vertex Express API key) ============
+express:
+  api_key: ""                       # Vertex Express API key (applied via AI Studio Express mode)
+  project_id: ""                    # GCP project ID the key belongs to (billing enabled)
+  location: "global"                # endpoint region; keep "global" (most Gemini models are only served
+                                    # from global; a bare model name gets routed to a region without the
+                                    # model and 404s — observed with gemini-2.5-pro -> asia-southeast1)
+
+# ============ Cookie channel (batchGraphql direct) ============
+cookie:
+  cookie: ""                        # full cookie string: on console.cloud.google.com run copy(document.cookie)
+  project_id: ""                    # project that works in Vertex AI Studio for this account
+  experiment_flags: ""              # experimentFlagsBinary — copy the whole batchGraphql request body field
+                                    # from DevTools (F12); relatively stable
+
+# ============ Thinking level ============
+# Forced thinking level: minimal | low | medium | high, empty = not forced.
+# OAI endpoint: client thinking-intent fields are always stripped; the forced value is used
+# when set, otherwise the model-family default level applies.
+# Gemini endpoint: when set, overrides client thinkingConfig; when empty, the client's
+# generationConfig.thinkingConfig is passed through.
+thinking_level: ""
+
+# ============ Retry ============
+retry:
+  max: 3                            # retries after failure; total attempts = max + 1
+  strategy: "backoff"               # fixed = wait `interval` seconds every time; backoff = linear 1s,2s,3s,...
+  interval: 2                       # fixed-strategy interval in seconds (ignored for backoff)

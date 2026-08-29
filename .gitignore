@@ -1,0 +1,15 @@
+# Rust 构建产物
+/target/
+
+# 真实配置（含密钥，绝不入库；仓库只保留 config.example.yaml）
+config.yaml
+
+# 逆向协议材料与 AI 守则——公开仓库永不入库（AGENTS.md 顶部「推送红线」，别移除这些条目）
+AGENTS.md
+docs/
+
+# 日志与临时文件
+*.log
+*.tmp
+msvc-dev.cmd
+vs-fix.cmd

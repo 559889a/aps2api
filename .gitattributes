@@ -1,0 +1,11 @@
+# 跨平台统一：仓库与工作副本一律 LF（Windows 开发 / Linux / Termux 构建混 scenarios，
+# CRLF 混入 shell 脚本或 Dockerfile 会直接炸）
+* text=auto eol=lf
+
+# 二进制标记
+*.png binary
+*.jpg binary
+*.ico binary
+*.exe binary
+*.gz binary
+*.zip binary
