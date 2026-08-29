@@ -1,25 +1,36 @@
 //! aps2api — Vertex Gemini 2api proxy (express + cookie dual upstream).
 //!
 //! Boot (spec §1.3/M0): load config.yaml + model.json from the binary's own
-//! directory (fallback: CWD for `cargo run` dev) → axum serve. Any config
-//! problem prints a field-naming error and exits.
+//! directory (fallback: CWD for `cargo run` dev) → build outbound clients →
+//! axum serve. Any config problem prints a field-naming error and exits.
 
+mod app;
 mod auth;
+mod channels;
 mod config;
+mod errs;
+mod gemini_port;
+mod httpx;
+mod images;
+mod ir;
+mod modelcaps;
+mod oai;
+mod pipeline;
+mod prefill;
+mod retry;
+mod rewrite;
+mod sapisid;
+mod streamscan;
 
-use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Request, State};
+use axum::extract::Request;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 
-#[derive(Clone)]
-pub struct AppState {
-    pub config: Arc<config::Config>,
-}
+use crate::app::AppState;
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
@@ -48,6 +59,7 @@ async fn main() {
         .init();
 
     let cfg = config::load_config();
+    let models = config::load_models();
     tracing::info!(
         port = cfg.port,
         express = cfg.express_enabled(),
@@ -57,10 +69,17 @@ async fn main() {
     );
 
     let bind_addr = format!("0.0.0.0:{}", cfg.port);
-    let state = AppState { config: Arc::new(cfg) };
+    let state = AppState::build(cfg, models).unwrap_or_else(|e| {
+        eprintln!("aps2api: {e}");
+        std::process::exit(1);
+    });
 
     let protected = Router::new()
-        // API routes are mounted in later milestones (/v1, /v1beta).
+        .route("/v1/models", get(oai::list_models))
+        .route("/v1/chat/completions", post(oai::chat_completions))
+        // Model names may contain '/' prefixes and ':operation' suffixes —
+        // dispatched manually inside (spec §10.1).
+        .route("/v1beta/{*rest}", any(gemini_port::dispatch))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_api_key,
