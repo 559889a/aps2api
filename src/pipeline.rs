@@ -139,6 +139,29 @@ fn log_give_up(
     );
 }
 
+/// Seconds at two-decimal precision for summary fields — a raw f64 printout
+/// of a Duration trails garbage digits (13.6123456789 s) that read as noise.
+fn secs_f64(d: std::time::Duration) -> f64 {
+    (d.as_secs_f64() * 100.0).round() / 100.0
+}
+
+/// Output token count from a `usageMetadata` object: candidatesTokenCount
+/// plus thoughtsTokenCount when present — thought text is part of the
+/// streamed output, so both count toward generation speed. None when the
+/// upstream reports no usable counts (the cookie channel never does, §7.2;
+/// the summary then logs without tokens/tps instead of a fake 0).
+fn usage_output_tokens(usage: &Value) -> Option<u64> {
+    match (
+        usage.get("candidatesTokenCount").and_then(Value::as_u64),
+        usage.get("thoughtsTokenCount").and_then(Value::as_u64),
+    ) {
+        (Some(c), Some(t)) => Some(c + t),
+        (Some(c), None) => Some(c),
+        (None, Some(t)) => Some(t),
+        (None, None) => None,
+    }
+}
+
 /// Streaming execution: spawns the retry pump, returns the receiver the axum
 /// body streams from. Each element is a wire-ready byte segment.
 pub async fn run_stream(
@@ -175,6 +198,11 @@ pub async fn run_stream(
         'outer: loop {
             // TTFB baseline: reset per attempt (a retry restarts the clock).
             let started = Instant::now();
+            // Stream-summary bookkeeping (owner request 2026-08-30), per
+            // attempt like the clock: when the first token landed and how
+            // many output tokens the usage trailer reported.
+            let mut first_token_at: Option<Instant> = None;
+            let mut output_tokens: Option<u64> = None;
             // Each attempt rebuilds the request inside start(): cookie
             // regenerates requestContext + SAPISIDHASH; express rebuilds the
             // request object (body is time-independent, §12.3).
@@ -257,9 +285,11 @@ pub async fn run_stream(
             // TTFB visibility (owner request 2026-08-30): time to the FIRST
             // semantic upstream event, logged for every successful response.
             // Bypass logs none (its upstream is non-streaming — no first
-            // token to time).
+            // token to time). The instant is kept for the end-of-stream
+            // summary (generation window + TPS).
             if let Some(ev) = &first {
                 if !matches!(ev, Ev::Error(_)) {
+                    first_token_at = Some(Instant::now());
                     tracing::info!(
                         channel = channel_name(channel),
                         model = %model,
@@ -273,6 +303,51 @@ pub async fn run_stream(
             loop {
                 let Some(ev) = next else {
                     // Upstream closed the stream normally.
+                    // Stream summary (owner request 2026-08-30): one line per
+                    // successful stream — wall clock, generation window, TPS,
+                    // output size, retries consumed. Streaming only: the
+                    // non-stream path (run_nonstream) and bypass end
+                    // differently and log no summary.
+                    if emitted {
+                        let total_s = secs_f64(started.elapsed());
+                        match first_token_at {
+                            Some(ft) => {
+                                let gen_dur = ft.elapsed();
+                                let gen_s = secs_f64(gen_dur);
+                                match output_tokens
+                                    .filter(|&t| t > 0 && gen_dur.as_secs_f64() > 0.0)
+                                {
+                                    Some(tokens) => tracing::info!(
+                                        channel = channel_name(channel),
+                                        model = %model,
+                                        total_s = total_s,
+                                        gen_s = gen_s,
+                                        tokens,
+                                        tps = (tokens as f64 / gen_dur.as_secs_f64() * 10.0)
+                                            .round()
+                                            / 10.0,
+                                        retries = attempt,
+                                        "stream complete"
+                                    ),
+                                    None => tracing::info!(
+                                        channel = channel_name(channel),
+                                        model = %model,
+                                        total_s = total_s,
+                                        gen_s = gen_s,
+                                        retries = attempt,
+                                        "stream complete"
+                                    ),
+                                }
+                            }
+                            None => tracing::info!(
+                                channel = channel_name(channel),
+                                model = %model,
+                                total_s = total_s,
+                                retries = attempt,
+                                "stream complete"
+                            ),
+                        }
+                    }
                     for b in em.on_stream_end() {
                         if tx.send(Ok(b)).await.is_err() {
                             return;
@@ -311,6 +386,9 @@ pub async fn run_stream(
                     return;
                 }
                 emitted = true;
+                if let Ev::Usage(u) = &ev {
+                    output_tokens = usage_output_tokens(u);
+                }
                 for b in em.on_event(&ev) {
                     if tx.send(Ok(b)).await.is_err() {
                         return; // client disconnected: stop everything
@@ -675,4 +753,45 @@ pub async fn run_bypass(
         }
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_output_tokens_sums_candidates_and_thoughts() {
+        // Live express sample 2026-08-30: 1/5/103 — thoughts are a separate
+        // counter and part of the streamed output, so both count for TPS.
+        let u = serde_json::json!({
+            "promptTokenCount": 1,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 97,
+            "totalTokenCount": 103
+        });
+        assert_eq!(usage_output_tokens(&u), Some(102));
+        assert_eq!(
+            usage_output_tokens(&serde_json::json!({"candidatesTokenCount": 7})),
+            Some(7)
+        );
+        assert_eq!(
+            usage_output_tokens(&serde_json::json!({"thoughtsTokenCount": 3})),
+            Some(3)
+        );
+        assert_eq!(usage_output_tokens(&serde_json::json!({})), None);
+        // Zero output stays Some(0): the summary then drops tps instead of
+        // logging a fake division result.
+        assert_eq!(
+            usage_output_tokens(&serde_json::json!({"candidatesTokenCount": 0})),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn secs_two_decimals() {
+        use std::time::Duration;
+        assert_eq!(secs_f64(Duration::from_millis(13_612)), 13.61);
+        assert_eq!(secs_f64(Duration::from_millis(13_600)), 13.6);
+        assert_eq!(secs_f64(Duration::ZERO), 0.0);
+    }
 }
