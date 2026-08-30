@@ -165,14 +165,16 @@ impl CookieClient {
         m
     }
 
+    /// One upstream attempt. The `stream` flag is deliberately IGNORED: the
+    /// batchGraphql surface has a single operation (StreamGenerateContent,
+    /// §7.2) — non-streaming requests are served by the pipeline aggregating
+    /// this event stream and replying with the complete JSON (run_nonstream).
     pub async fn start(
         &self,
         payload: &Value,
         model: &str,
         _stream: bool,
     ) -> Result<EvStream, UpstreamError> {
-        // batchGraphql has a single operation (StreamGenerateContent);
-        // non-streaming is aggregated from the same event stream (§7.2).
         crate::channels::express::log_outbound(payload);
         let body = self.build_body(payload, model);
         let resp = self
@@ -359,6 +361,28 @@ mod tests {
         cookie_extract(&obj, &mut out);
         assert!(matches!(&out[0], Ev::Text(t) if t == "hi"));
         assert!(matches!(&out[1], Ev::Error(e) if e.kind == ErrorKind::RateLimit));
+    }
+
+    #[test]
+    fn non_streaming_is_always_served_by_stream_aggregation() {
+        // Regression pin (§7.2): the cookie upstream has ONE operation —
+        // StreamGenerateContent. When a client sends a NON-streaming request
+        // routed to this channel, the pipeline (run_nonstream) intercepts the
+        // SSE event stream, aggregates it, and replies with the complete
+        // JSON — so the shell must declare the stream operation no matter
+        // which `stream` flag the port layer passed down.
+        let c = CookieClient::new(
+            wreq::Client::builder().build().unwrap(),
+            &CookieConfig {
+                cookie: "SAPISID=x".into(),
+                project_id: "proj".into(),
+                experiment_flags: String::new(),
+            },
+        );
+        let payload = json!({ "contents": [{ "role": "user", "parts": [] }] });
+        let body: Value = serde_json::from_str(&c.build_body(&payload, "m")).unwrap();
+        assert_eq!(body["operationName"], "StreamGenerateContent");
+        assert!(body["variables"]["contents"].is_array());
     }
 
     #[test]
