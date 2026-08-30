@@ -12,6 +12,8 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
+use serde_json::Value;
+
 const MAX_REDIRECTS: usize = 3;
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
@@ -145,6 +147,43 @@ fn use_base64(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
+/// Walk `parts` in place, replacing `remoteFetch` placeholders with inlineData
+/// parts (spec §9.3); a failed fetch drops the part. The walk advances the
+/// index EXPLICITLY and never after a `remove`: a removal shifts the next
+/// part into the current slot, so a naive `for i in 0..len` loop both skips
+/// the part after a dropped one and eventually indexes out of bounds (panic).
+/// `fetch` receives an owned URL and returns a self-contained future (capture
+/// whatever it needs by value — e.g. clone the shared client into itself).
+pub async fn resolve_remote_parts<F, Fut>(parts: &mut Vec<Value>, fetch: F)
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(String, String), String>>,
+{
+    let mut i = 0;
+    while i < parts.len() {
+        let Some(url) = parts[i]
+            .get("remoteFetch")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            i += 1;
+            continue;
+        };
+        match fetch(url.clone()).await {
+            Ok((mime, b64)) => {
+                parts[i] = serde_json::json!({
+                    "inlineData": { "mimeType": mime, "data": b64 }
+                });
+                i += 1;
+            }
+            Err(e) => {
+                tracing::warn!(url = %url, error = %e, "remote image fetch failed; part dropped");
+                parts.remove(i);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +203,40 @@ mod tests {
         assert!(blocked_ip("fe80::1".parse().unwrap()));
         assert!(blocked_ip("fd00::1".parse().unwrap()));
         assert!(!blocked_ip("2606:4700::1111".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn failed_fetch_drops_part_without_skipping_or_panicking() {
+        // Regression: the previous `for i in 0..parts.len()` loop panicked
+        // (index out of bounds) whenever a fetch failed and more parts
+        // followed, and skipped the part that slid into the freed slot.
+        let mut parts = vec![
+            serde_json::json!({ "text": "hi" }),
+            serde_json::json!({ "remoteFetch": "http://x/fail.png" }),
+            serde_json::json!({ "remoteFetch": "http://x/ok.png" }),
+            serde_json::json!({ "text": "bye" }),
+        ];
+        resolve_remote_parts(&mut parts, |url| async move {
+            if url.ends_with("fail.png") {
+                Err("remote image rejected: HTTP 404".to_string())
+            } else {
+                Ok(("image/png".to_string(), "QQ==".to_string()))
+            }
+        })
+        .await;
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["text"], "hi");
+        assert_eq!(parts[1]["inlineData"]["data"], "QQ==");
+        assert_eq!(parts[2]["text"], "bye");
+    }
+
+    #[tokio::test]
+    async fn all_parts_failing_leaves_empty_without_panic() {
+        let mut parts = vec![
+            serde_json::json!({ "remoteFetch": "http://x/a.png" }),
+            serde_json::json!({ "remoteFetch": "http://x/b.png" }),
+        ];
+        resolve_remote_parts(&mut parts, |_url| async { Err("nope".to_string()) }).await;
+        assert!(parts.is_empty());
     }
 }

@@ -177,32 +177,20 @@ pub fn resolve_model_name(
 /// Replace remote-fetch placeholders (produced by oai::parse) with inlineData
 /// parts (spec §9.3). Failures log a warning and drop the part.
 async fn fetch_remote_parts(state: &AppState, contents: &mut [Value]) {
+    let client = state
+        .ctx
+        .image_client
+        .clone()
+        .expect("image client configured");
+    let proxied = state.config.socks5.is_some();
+    let fetch = move |url: String| {
+        let client = client.clone();
+        async move { crate::images::fetch_remote_image(&client, proxied, &url).await }
+    };
     for turn in contents.iter_mut() {
         let Some(parts) = turn.get_mut("parts").and_then(Value::as_array_mut) else {
             continue;
         };
-        for i in 0..parts.len() {
-            let url = match parts[i].get("remoteFetch").and_then(Value::as_str) {
-                Some(u) => u.to_string(),
-                None => continue,
-            };
-            let client = state
-                .ctx
-                .image_client
-                .clone()
-                .expect("image client configured");
-            let proxied = state.config.socks5.is_some();
-            match crate::images::fetch_remote_image(&client, proxied, &url).await {
-                Ok((mime, b64)) => {
-                    parts[i] = json!({
-                        "inlineData": { "mimeType": mime, "data": b64 }
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(url = %url, error = %e, "remote image fetch failed; part dropped");
-                    parts.remove(i);
-                }
-            }
-        }
+        crate::images::resolve_remote_parts(parts, &fetch).await;
     }
 }
