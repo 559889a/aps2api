@@ -124,16 +124,42 @@ Auth for every endpoint except `/health`: `Authorization: Bearer <api_key>` or
 
 ```
 aps2api/
-├── Cargo.toml               # pinned dependencies (spec appendix C.2 discipline)
-├── config.example.yaml      # all-empty commented config template
-├── model.json               # default three-model example list
-├── .github/workflows/ci.yml # fmt/clippy/test + three-platform debug builds
+├── Cargo.toml                       # pinned dependencies (appendix C.2 discipline)
+├── config.example.yaml              # all-empty commented config template
+├── model.json                       # default model list (models + alias_map)
+├── .github/workflows/ci.yml         # fmt/clippy/test + three-platform debug builds
+├── .github/workflows/release.yml    # tag-triggered three-platform release packaging
+├── .github/workflows/debug-build.yml # manual three-platform debug artifacts (pre-release smoke)
 ├── examples/
-│   └── tls_check.rs        # TLS-fingerprint self-check vs a real Chrome (appendix C.4)
+│   └── tls_check.rs                 # TLS-fingerprint self-check vs a real Chrome (C.4)
 └── src/
-    ├── main.rs              # boot: load config + model list, axum serve, request log
-    ├── config.rs            # config.yaml / model.json loading and validation
-    └── auth.rs              # local API key middleware (Bearer / x-goog-api-key)
+    ├── main.rs                      # boot: load config + model list, axum serve, route assembly
+    ├── app.rs                       # AppState assembly: config + model list + outbound clients
+    ├── auth.rs                      # local API key middleware (Bearer / x-goog-api-key)
+    ├── config.rs                    # config.yaml / model.json loading and validation
+    ├── errs.rs                      # upstream error taxonomy (§14) + user-facing hints
+    ├── gemini_port/
+    │   ├── mod.rs                   # /v1beta dispatch: prefix stripping, %2F decode, routes
+    │   ├── parse.rs                 # Gemini request normalization -> ir (§10.2)
+    │   └── emit.rs                  # events -> SSE chunks / aggregated response (§10.3)
+    ├── httpx.rs                     # outbound clients: reqwest (express) + wreq (cookie), socks5h
+    ├── images.rs                    # remote image fetch with SSRF protection (§9.3)
+    ├── ir.rs                        # internal representation + unified event stream (§4)
+    ├── modelcaps.rs                 # model capability profiles + level clamp (§3)
+    ├── oai/
+    │   ├── mod.rs                   # /v1 routes: model list + chat completions (§9)
+    │   ├── parse.rs                 # OAI request -> ir (§9.2)
+    │   └── emit.rs                  # events -> OAI SSE chunks / chat.completion JSON (§9.4)
+    ├── pipeline.rs                  # shared retry loop: emitted guard, budget, disconnect (§12)
+    ├── prefill.rs                   # prefill engine: nudge, CoT guard, deduper (§11)
+    ├── rewrite.rs                   # outbound payload rewrite matrix + safety injection (§8)
+    ├── retry.rs                     # backoff/fixed waits + SSE keep-alive heartbeats (§12.4)
+    ├── sapisid.rs                   # cookie parsing, validation, SAPISIDHASH x3 (§7.1)
+    ├── streamscan.rs                # bracket-balanced streaming JSON extractor (§13.1)
+    └── channels/
+        ├── mod.rs                   # client enum-dispatch + unified event extraction (§13.2)
+        ├── express.rs               # express channel: native Gemini REST (§5)
+        └── cookie.rs                # cookie channel: wreq Chrome149 masquerade (§6/§7)
 ```
 
 ## License

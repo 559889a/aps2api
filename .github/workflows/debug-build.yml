@@ -1,0 +1,78 @@
+name: Debug build (pre-release smoke)
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    name: debug artifact (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build (debug)
+        run: cargo build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aps2api-debug-x86_64-pc-windows-msvc
+          path: |
+            target/debug/aps2api.exe
+            config.example.yaml
+            model.json
+
+  build-linux:
+    name: debug artifact (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install BoringSSL build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake perl nasm libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo build (debug)
+        run: cargo build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aps2api-debug-x86_64-unknown-linux-gnu
+          path: |
+            target/debug/aps2api
+            config.example.yaml
+            model.json
+
+  build-termux:
+    name: debug artifact (aarch64-linux-android / termux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install BoringSSL build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake perl ninja-build
+      - name: Set up NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo ndk build (aarch64, API 24+)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          CC_aarch64_linux_android: aarch64-linux-android24-clang
+          CXX_aarch64_linux_android: aarch64-linux-android24-clang++
+          AR_aarch64_linux_android: llvm-ar
+        run: cargo ndk -t arm64-v8a -p 24 build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aps2api-debug-aarch64-linux-android
+          path: |
+            target/aarch64-linux-android/debug/aps2api
+            config.example.yaml
+            model.json
