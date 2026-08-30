@@ -37,7 +37,9 @@ pub struct Ctx {
     pub express: Option<UpstreamClient>,
     pub cookie: Option<UpstreamClient>,
     /// Dedicated reqwest client for remote image fetching (redirects off).
-    pub image_client: Option<reqwest::Client>,
+    /// Always present (built unconditionally in AppState::build) — a plain
+    /// field keeps the port handlers panic-free.
+    pub image_client: reqwest::Client,
 }
 
 /// Adapter: mpsc receiver as a `Stream` for `Body::from_stream`.
@@ -389,7 +391,8 @@ pub async fn run_bypass(
                                 kind: ErrorKind::Transport,
                                 status: None,
                                 message: format!(
-                                    "upstream did not produce any content within the bypass                                      first-response budget ({}s)",
+                                    "upstream did not produce any content within the bypass \
+                                     first-response budget ({}s)",
                                     retry::BYPASS_FIRST_RESPONSE_BUDGET.as_secs()
                                 ),
                             };

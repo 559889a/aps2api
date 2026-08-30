@@ -53,7 +53,7 @@ impl AppState {
             config: config.clone(),
             express,
             cookie,
-            image_client: Some(image_client),
+            image_client,
         });
 
         Ok(AppState {

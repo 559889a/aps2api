@@ -195,11 +195,7 @@ pub fn resolve_model_name(
 /// Replace remote-fetch placeholders (produced by oai::parse) with inlineData
 /// parts (spec §9.3). Failures log a warning and drop the part.
 async fn fetch_remote_parts(state: &AppState, contents: &mut [Value]) {
-    let client = state
-        .ctx
-        .image_client
-        .clone()
-        .expect("image client configured");
+    let client = state.ctx.image_client.clone();
     let proxied = state.config.socks5.is_some();
     let fetch = move |url: String| {
         let client = client.clone();

@@ -105,19 +105,19 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         }
     };
 
-    let ok_model = match resolve_and_info(&state, model) {
-        Ok(m) => m,
-        Err(e) => return gemini_error(e),
-    };
-
+    // `model` may carry an express//cookie//fake-streaming prefix (spec
+    // §2.2/§9.5) — pass it through WHOLE. The prefix must survive to
+    // parse::parse (which splits it into forced channel / bypass flag);
+    // resolving the alias early and dropping the prefix silently routed
+    // every prefixed Gemini request onto the DEFAULT channel.
     let body = match read_json_body(req).await {
         Ok(b) => b,
         Err(e) => return gemini_error(e),
     };
 
     match op {
-        "generateContent" => handle(state, ok_model, false, body).await,
-        "streamGenerateContent" => handle(state, ok_model, true, body).await,
+        "generateContent" => handle(state, model.to_string(), false, body).await,
+        "streamGenerateContent" => handle(state, model.to_string(), true, body).await,
         other => gemini_error(ApiError {
             status: 404,
             message: format!("unsupported operation {other:?}"),
@@ -126,6 +126,8 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
 }
 
 /// Strip any channel prefix, resolve aliases, and 404 on unknown models.
+/// Used for GET model-info requests; POST requests keep their prefix (the
+/// channel/bypass routing happens in parse::parse).
 fn resolve_and_info(state: &AppState, model: &str) -> Result<String, ApiError> {
     let (bare, _forced, _bypass) = crate::ir::split_model_name(model);
     oai::resolve_model_name(&state.models.alias_map, &state.models.models, &bare)
@@ -199,6 +201,11 @@ async fn handle_inner(
             )
         })?;
 
+    // alias_map rewrite, then 404 for models outside model.json — same order
+    // as the OAI port (the bypass gate above runs first, so a disabled
+    // fake-streaming alias reports the switch instead of a 404).
+    ir.model = oai::resolve_model_name(&state.models.alias_map, &state.models.models, &ir.model)?;
+
     let profile = modelcaps::profile(&ir.model);
     ir.prefill = prefill::apply_request(&mut ir.contents, profile.requires_user_last_turn);
     fetch_remote_parts(state, &mut ir.contents).await;
@@ -247,11 +254,7 @@ async fn handle_inner(
 }
 
 async fn fetch_remote_parts(state: &AppState, contents: &mut [Value]) {
-    let client = state
-        .ctx
-        .image_client
-        .clone()
-        .expect("image client configured");
+    let client = state.ctx.image_client.clone();
     let proxied = state.config.socks5.is_some();
     let fetch = move |url: String| {
         let client = client.clone();
@@ -262,5 +265,124 @@ async fn fetch_remote_parts(state: &AppState, contents: &mut [Value]) {
             continue;
         };
         crate::images::resolve_remote_parts(parts, &fetch).await;
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::any;
+    use tower::ServiceExt;
+
+    fn express_only_state(bypass: bool) -> AppState {
+        let cfg = crate::config::Config {
+            api_key: "k".into(),
+            port: 8080,
+            socks5: None,
+            express: crate::config::ExpressConfig {
+                api_key: "AQ.test-key".into(),
+                project_id: "p".into(),
+                location: "global".into(),
+            },
+            cookie: crate::config::CookieConfig::default(),
+            thinking_level: String::new(),
+            bypass,
+            retry: Default::default(),
+        };
+        let models = crate::config::ModelFile {
+            models: vec!["m1".to_string()],
+            alias_map: Default::default(),
+        };
+        AppState::build(cfg, models).expect("test state builds")
+    }
+
+    async fn post(state: AppState, path: &str, body: &str) -> (StatusCode, String) {
+        let app = axum::Router::new()
+            .route("/v1beta/{*rest}", any(dispatch))
+            .with_state(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!("http://test{path}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    const CHAT: &str = r#"{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#;
+
+    #[tokio::test]
+    async fn channel_prefix_routes_the_forced_channel() {
+        // Regression (2026-08-30): dispatch used to strip the
+        // express//cookie/ prefix (resolve_and_info) before parse, silently
+        // routing every prefixed request onto the DEFAULT channel — spec
+        // §2.2 forces the channel on BOTH ports. With only express
+        // configured, `cookie/m1` must fail with the not-configured error
+        // instead of falling through to express.
+        let state = express_only_state(false);
+        let (status, body) = post(state, "/v1beta/models/cookie/m1:generateContent", CHAT).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("cookie channel"),
+            "expected the forced-cookie routing error, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bypass_alias_gate_applies_on_the_gemini_port() {
+        // `fake-streaming/express/<model>` must hit the §9.5 gate (the prefix
+        // has to reach parse), not fall through to a bare-model 404 or a
+        // default-channel upstream request.
+        let state = express_only_state(false);
+        let (status, body) = post(
+            state,
+            "/v1beta/models/fake-streaming/express/m1:generateContent",
+            CHAT,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("bypass mode is disabled"),
+            "expected the bypass gate error, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_model_is_404() {
+        let state = express_only_state(false);
+        let (status, body) = post(state, "/v1beta/models/nope:generateContent", CHAT).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body.contains("not in model.json"),
+            "expected the model.json 404, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_streaming_cookie_shape_is_rejected_by_the_gate() {
+        // `fake-streaming/cookie/...` is a gate rejection (§9.5), reachable
+        // only when the prefix survives dispatch.
+        let state = express_only_state(true);
+        let (status, body) = post(
+            state,
+            "/v1beta/models/fake-streaming/cookie/m1:generateContent",
+            CHAT,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.contains("express channel only"),
+            "expected the express-only alias error, got: {body}"
+        );
     }
 }
