@@ -58,7 +58,7 @@ impl JsonStreamScanner {
 
     pub fn with_limit(max_buffer: usize) -> Self {
         JsonStreamScanner {
-            buf: String::new(),
+            buf: Vec::new(),
             consumed: 0,
             object_start: None,
             depth: 0,
