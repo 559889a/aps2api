@@ -32,26 +32,26 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-    matrix:
-      include:
-        # label = user-facing platform name in release assets (AGENTS.md §5);
-        # target triples stay internal to build/packaging paths only.
-        - name: x86_64-pc-windows-msvc
-          os: windows-latest
-          target: x86_64-pc-windows-msvc
-          label: windows-x64
-          archive: zip
-        - name: x86_64-unknown-linux-gnu
-          os: ubuntu-latest
-          target: x86_64-unknown-linux-gnu
-          label: linux-x64
-          archive: tar
-        - name: aarch64-linux-android (termux)
-          os: ubuntu-latest
-          target: aarch64-linux-android
-          label: android-arm64
-          archive: tar
-          android: true
+      matrix:
+        include:
+          # label = user-facing platform name in release assets (AGENTS.md §5);
+          # target triples stay internal to build/packaging paths only.
+          - name: x86_64-pc-windows-msvc
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            label: windows-x64
+            archive: zip
+          - name: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: linux-x64
+            archive: tar
+          - name: aarch64-linux-android (termux)
+            os: ubuntu-latest
+            target: aarch64-linux-android
+            label: android-arm64
+            archive: tar
+            android: true
     steps:
       - uses: actions/checkout@v4
 
