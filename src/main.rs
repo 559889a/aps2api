@@ -86,7 +86,11 @@ async fn main() {
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_api_key,
-        ));
+        ))
+        // axum's default body limit is 2MB and would 413 image-bearing
+        // requests (base64 data URLs); match the Gemini port's explicit
+        // 64MB cap (§9.2/§10.2).
+        .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024));
 
     let app = Router::new()
         .route("/health", get(health))
