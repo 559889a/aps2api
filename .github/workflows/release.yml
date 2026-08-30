@@ -56,7 +56,7 @@ jobs:
 
       - name: Install BoringSSL build dependencies (android)
         if: matrix.android
-        run: sudo apt-get update && sudo apt-get install -y cmake perl ninja-build
+        run: sudo apt-get update && sudo apt-get install -y cmake perl ninja-build libclang-dev
 
       - name: Set up NDK
         if: matrix.android
@@ -66,13 +66,23 @@ jobs:
           ndk-version: r27c
           add-to-path: true
 
+      # setup-ndk puts only the NDK root on PATH; the clang wrappers
+      # (aarch64-linux-android24-clang) live one level deeper. CC/AR below
+      # are bare names and need this to resolve (live-tested 2026-08-30).
+      - name: Add NDK clang wrappers to PATH
+        if: matrix.android
+        run: echo "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.android && 'aarch64-linux-android' || '' }}
 
+      # Pinned: 4.x renamed the platform flag from `-p` to `-P`/`--platform`
+      # and now treats `-p` as cargo's `--package` passthrough (panic:
+      # "unknown package: 24").
       - name: Install cargo-ndk
         if: matrix.android
-        run: cargo install cargo-ndk --locked
+        run: cargo install cargo-ndk --locked --version 4.1.2
 
       - uses: Swatinem/rust-cache@v2
 
@@ -84,10 +94,11 @@ jobs:
         if: matrix.android
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           CC_aarch64_linux_android: aarch64-linux-android24-clang
           CXX_aarch64_linux_android: aarch64-linux-android24-clang++
           AR_aarch64_linux_android: llvm-ar
-        run: cargo ndk -t arm64-v8a -p 24 build --release
+        run: cargo ndk -t arm64-v8a --platform 24 build --release
 
       - name: Package (windows zip)
         if: matrix.archive == 'zip'

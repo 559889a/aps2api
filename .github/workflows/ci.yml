@@ -65,26 +65,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install BoringSSL build dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake perl ninja-build
+        run: sudo apt-get update && sudo apt-get install -y cmake perl ninja-build libclang-dev
       - name: Set up NDK
         uses: nttld/setup-ndk@v1
         id: setup-ndk
         with:
           ndk-version: r27c
           add-to-path: true
+      # setup-ndk puts only the NDK root on PATH; the clang wrappers
+      # (aarch64-linux-android24-clang) live one level deeper. CC/AR above
+      # are bare names and need this to resolve (live-tested 2026-08-30).
+      - name: Add NDK clang wrappers to PATH
+        run: echo "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
+      # Pinned: 4.x renamed the platform flag from `-p` to `-P`/`--platform`
+      # and now treats `-p` as cargo's `--package` passthrough (panic:
+      # "unknown package: 24").
       - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
+        run: cargo install cargo-ndk --locked --version 4.1.2
       - uses: Swatinem/rust-cache@v2
       - name: cargo ndk build (aarch64, API 24+)
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
           CC_aarch64_linux_android: aarch64-linux-android24-clang
           CXX_aarch64_linux_android: aarch64-linux-android24-clang++
           AR_aarch64_linux_android: llvm-ar
-        run: cargo ndk -t arm64-v8a -p 24 build
+        run: cargo ndk -t arm64-v8a --platform 24 build
       - name: Upload debug artifact
         uses: actions/upload-artifact@v4
         with:
