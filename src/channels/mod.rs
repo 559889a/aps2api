@@ -119,8 +119,14 @@ where
         match stream.next().await {
             Some(Ok(bytes)) => {
                 buf.push_str(&String::from_utf8_lossy(&bytes));
-                while let Some(pos) = buf.find('\n') {
-                    let line = &buf[..pos];
+                // Walk every complete line in place via a cursor, then reclaim
+                // them all with ONE drain: draining per line memmoves the rest
+                // of the chunk on each iteration — O(chunk^2) for line-heavy
+                // chunks (many small SSE events coalesced by TCP).
+                let mut consumed = 0usize;
+                while let Some(rel) = buf[consumed..].find('\n') {
+                    let pos = consumed + rel;
+                    let line = &buf[consumed..pos];
                     if let Some(data) = line.strip_prefix("data:") {
                         let data = data.trim();
                         if !data.is_empty() && data != "[DONE]" {
@@ -128,7 +134,10 @@ where
                         }
                     }
                     // comment lines (`: ...`) and blank lines: ignored
-                    buf.drain(..=pos);
+                    consumed = pos + 1;
+                }
+                if consumed > 0 {
+                    buf.drain(..consumed);
                 }
                 if buf.len() > max_line {
                     // No newline within the cap: protocol garbage, not SSE.
@@ -379,6 +388,32 @@ mod tests {
                 assert_eq!(e.kind, ErrorKind::Invalid, "floods must not be retryable");
             }
             other => panic!("expected error event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn many_lines_in_one_chunk_all_parse() {
+        // TCP coalesces several SSE events into one read; the cursor-based
+        // line walk must emit every event exactly once, in order.
+        let (tx, mut rx) = mpsc::channel::<Ev>(128);
+        let body: String = (0..50)
+            .map(|i| {
+                format!(
+                    "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"{i}\"}}]}}}}]}}\n\n"
+                )
+            })
+            .collect();
+        let stream = futures_util::stream::iter(vec![Ok::<Bytes, std::convert::Infallible>(
+            Bytes::from(body),
+        )]);
+        pump_sse_with_limit(stream, tx, 1 << 20).await;
+        let mut seen = Vec::new();
+        while let Some(Ev::Text(t)) = rx.recv().await {
+            seen.push(t);
+        }
+        assert_eq!(seen.len(), 50);
+        for (i, t) in seen.iter().enumerate() {
+            assert_eq!(t, &i.to_string());
         }
     }
 
