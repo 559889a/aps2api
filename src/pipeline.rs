@@ -334,37 +334,89 @@ pub async fn run_bypass(
         'outer: loop {
             // Non-streaming upstream: stream=false regardless of the client's
             // SSE request (that is the whole point of bypass).
-            let mut stream = match client.start(&payload, &model, false).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if e.retryable() && attempt < cfg.retry.max {
-                        attempt += 1;
-                        if !retry::wait_with_heartbeat(
-                            retry::retry_delay(&cfg.retry, attempt),
-                            true,
-                            &tx,
-                        )
-                        .await
-                        {
-                            return; // client gone
+            //
+            // Phase 1: drive start() under the heartbeat cadence. On
+            // :generateContent the response HEADERS arrive only when the
+            // whole answer is ready, so TTFB is most of the silent window —
+            // heartbeats must already flow here (live-measured: a 13.6s
+            // generation produced zero heartbeats when only the body phase
+            // was monitored). timeout() cancels only its own poll tick, the
+            // pinned future keeps its progress (I/O wakes drive it forward).
+            let start_fut = client.start(&payload, &model, false);
+            tokio::pin!(start_fut);
+            let mut waited = std::time::Duration::ZERO;
+            let mut stream = loop {
+                match tokio::time::timeout(retry::HEARTBEAT_EVERY, start_fut.as_mut()).await {
+                    Ok(Ok(s)) => break s,
+                    Ok(Err(e)) => {
+                        if e.retryable() && attempt < cfg.retry.max {
+                            attempt += 1;
+                            if !retry::wait_with_heartbeat(
+                                retry::retry_delay(&cfg.retry, attempt),
+                                true,
+                                &tx,
+                            )
+                            .await
+                            {
+                                return; // client gone
+                            }
+                            continue 'outer;
                         }
-                        continue 'outer;
+                        for b in em.on_error(&e) {
+                            if tx.send(Ok(b)).await.is_err() {
+                                return;
+                            }
+                        }
+                        return;
                     }
-                    for b in em.on_error(&e) {
-                        if tx.send(Ok(b)).await.is_err() {
+                    Err(_elapsed) => {
+                        waited += retry::HEARTBEAT_EVERY;
+                        if waited >= retry::BYPASS_FIRST_RESPONSE_BUDGET {
+                            if attempt < cfg.retry.max {
+                                attempt += 1;
+                                if !retry::wait_with_heartbeat(
+                                    retry::retry_delay(&cfg.retry, attempt),
+                                    true,
+                                    &tx,
+                                )
+                                .await
+                                {
+                                    return;
+                                }
+                                continue 'outer;
+                            }
+                            let e = UpstreamError {
+                                kind: ErrorKind::Transport,
+                                status: None,
+                                message: format!(
+                                    "upstream did not produce any content within the bypass                                      first-response budget ({}s)",
+                                    retry::BYPASS_FIRST_RESPONSE_BUDGET.as_secs()
+                                ),
+                            };
+                            for b in em.on_error(&e) {
+                                if tx.send(Ok(b)).await.is_err() {
+                                    return;
+                                }
+                            }
                             return;
                         }
+                        // Keep-alive + disconnect detection (3s granularity).
+                        if tx
+                            .send(Ok(Bytes::from_static(retry::HEARTBEAT)))
+                            .await
+                            .is_err()
+                        {
+                            return; // client gone: drop upstream + pump
+                        }
                     }
-                    return;
                 }
             };
 
-            // Collect the complete upstream response, heartbeating through
-            // every silent stretch. The budget bounds only the wait for the
-            // FIRST event (a non-stream upstream emits everything at once at
-            // the end); afterwards the heartbeat cadence runs unbounded.
+            // Phase 2: collect the complete upstream response, heartbeating
+            // through every silent stretch. The budget bounds only the wait
+            // for the FIRST event (a non-stream upstream emits everything at
+            // once at the end); afterwards the cadence runs unbounded.
             let mut events: Vec<Ev> = Vec::new();
-            let mut waited = std::time::Duration::ZERO;
             let outcome = loop {
                 match tokio::time::timeout(retry::HEARTBEAT_EVERY, stream.next()).await {
                     Ok(Some(Ev::Error(e))) => break Err(e),
