@@ -93,9 +93,23 @@ fn transport_err(message: String) -> Ev {
     })
 }
 
+/// Cap for one buffered SSE line: a `data:` payload carrying a base64 image
+/// can reach ~27MB, so 64MB leaves headroom. A longer line means the peer is
+/// not speaking the protocol — fail the stream instead of growing memory.
+pub(crate) const MAX_SSE_LINE: usize = 64 * 1024 * 1024;
+
 /// SSE pump (spec §13.3): one `data: <json>` per event; comment and empty
-/// lines ignored; no `[DONE]` marker in the Gemini protocol.
-pub(crate) async fn pump_sse<S, E>(mut stream: S, tx: mpsc::Sender<Ev>)
+/// lines ignored; no `[DONE]` marker in the Gemini protocol. Lines are
+/// parsed in place (borrowed from the buffer — no per-line allocation).
+pub(crate) async fn pump_sse<S, E>(stream: S, tx: mpsc::Sender<Ev>)
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    pump_sse_with_limit(stream, tx, MAX_SSE_LINE).await
+}
+
+pub(crate) async fn pump_sse_with_limit<S, E>(mut stream: S, tx: mpsc::Sender<Ev>, max_line: usize)
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
@@ -106,16 +120,29 @@ where
             Some(Ok(bytes)) => {
                 buf.push_str(&String::from_utf8_lossy(&bytes));
                 while let Some(pos) = buf.find('\n') {
-                    let line: String = buf.drain(..=pos).collect();
-                    let line = line.trim_end_matches(['\n', '\r']);
+                    let line = &buf[..pos];
                     if let Some(data) = line.strip_prefix("data:") {
                         let data = data.trim();
-                        if data.is_empty() || data == "[DONE]" {
-                            continue;
+                        if !data.is_empty() && data != "[DONE]" {
+                            emit_json(&tx, data).await;
                         }
-                        emit_json(&tx, data).await;
                     }
                     // comment lines (`: ...`) and blank lines: ignored
+                    buf.drain(..=pos);
+                }
+                if buf.len() > max_line {
+                    // No newline within the cap: protocol garbage, not SSE.
+                    // Invalid (non-retryable): re-reading would flood again.
+                    let _ = tx
+                        .send(Ev::Error(UpstreamError {
+                            kind: ErrorKind::Invalid,
+                            status: None,
+                            message: format!(
+                                "upstream SSE line exceeded the buffer limit ({max_line} bytes)"
+                            ),
+                        }))
+                        .await;
+                    return;
                 }
             }
             Some(Err(e)) => {
@@ -130,8 +157,9 @@ where
 }
 
 /// Concatenated-JSON pump (spec §13.1): batchGraphql streams consecutive
-/// top-level JSON objects; a bracket-balancing scanner extracts them and the
-/// channel-specific `extract` callback turns each object into events.
+/// top-level JSON objects; the bracket-balancing scanner extracts them as
+/// borrowed slices and the channel-specific `extract` callback turns each
+/// object into events.
 pub(crate) async fn pump_concat<S, E, F>(mut stream: S, tx: mpsc::Sender<Ev>, mut extract: F)
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -142,8 +170,9 @@ where
     loop {
         match stream.next().await {
             Some(Ok(bytes)) => {
-                for obj in scanner.feed(&String::from_utf8_lossy(&bytes)) {
-                    match serde_json::from_str::<Value>(&obj) {
+                let chunk = String::from_utf8_lossy(&bytes);
+                for range in scanner.feed(&chunk) {
+                    match serde_json::from_str::<Value>(scanner.object(range)) {
                         Ok(v) => {
                             let mut events = Vec::new();
                             extract(&v, &mut events);
@@ -162,6 +191,19 @@ where
                                 .await;
                         }
                     }
+                }
+                if scanner.overflowed() {
+                    let _ = tx
+                        .send(Ev::Error(errs::classify_error(
+                            None,
+                            format!(
+                                "upstream JSON object exceeded the scan buffer limit \
+                                 ({} bytes)",
+                                crate::streamscan::MAX_SCAN_BUFFER
+                            ),
+                        )))
+                        .await;
+                    return;
                 }
             }
             Some(Err(e)) => {
@@ -312,6 +354,33 @@ pub fn extract_from_chunk(chunk: &Value, out: &mut Vec<Ev>) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn sse_lines_parse_in_place() {
+        let (tx, mut rx) = mpsc::channel::<Ev>(8);
+        let payload = r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}"#;
+        let stream = futures_util::stream::iter(vec![Ok::<Bytes, std::convert::Infallible>(
+            Bytes::from(format!(": comment\n\ndata: {payload}\n\ndata: [DONE]\n\n")),
+        )]);
+        pump_sse_with_limit(stream, tx, 1024).await;
+        assert!(matches!(rx.recv().await, Some(Ev::Text(t)) if t == "hi"));
+        assert!(rx.recv().await.is_none(), "comment/[DONE] produce nothing");
+    }
+
+    #[tokio::test]
+    async fn oversized_sse_line_fails_the_stream_without_retry() {
+        let (tx, mut rx) = mpsc::channel::<Ev>(8);
+        let stream = futures_util::stream::iter(vec![Ok::<Bytes, std::convert::Infallible>(
+            Bytes::from(format!("data: {}", "x".repeat(64))),
+        )]);
+        pump_sse_with_limit(stream, tx, 16).await;
+        match rx.recv().await {
+            Some(Ev::Error(e)) => {
+                assert_eq!(e.kind, ErrorKind::Invalid, "floods must not be retryable");
+            }
+            other => panic!("expected error event, got {other:?}"),
+        }
+    }
 
     #[test]
     fn text_thought_and_finish_extracted() {

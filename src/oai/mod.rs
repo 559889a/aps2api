@@ -126,7 +126,7 @@ async fn handle_chat(state: &AppState, body: &Value) -> Result<Response, ApiErro
     fetch_remote_parts(state, &mut ir.contents).await;
 
     let payload = rewrite::build_payload(
-        &ir,
+        &mut ir,
         PortKind::Oai,
         &state.config.thinking_level,
         &profile,

@@ -122,18 +122,25 @@ fn system_text(system: &Value) -> String {
 
 /// Build the upstream request body in Gemini GenerateContentRequest shape
 /// from the ir (spec §5.2). The cookie channel wraps the returned value in
-/// its GraphQL shell; the express channel posts it as-is.
+/// its GraphQL shell; the express channel posts it as-is. Consumes the
+/// ir's contents/system/generation_config by move (the handlers read only
+/// the model/prefill/stream metadata afterwards).
 pub fn build_payload(
-    ir: &Ir,
+    ir: &mut Ir,
     port: PortKind,
     forced_level: &str,
     profile: &Profile,
     channel: Channel,
 ) -> Value {
-    let mut contents = ir.contents.clone();
+    // Zero-copy: contents/system/generation_config MOVE out of the ir — the
+    // port handlers never touch them after this call, and the only mutation
+    // they need is the rare §8.5 degradation insert. Contents can carry
+    // megabytes of base64 images; a deep clone per request is hot-path cost
+    // for nothing.
+    let mut contents = std::mem::take(&mut ir.contents);
 
     // ---- systemInstruction (§8.5) ----
-    let mut system = ir.system.clone();
+    let mut system = ir.system.take();
     if system.is_some() && !has_user_turn(&contents) {
         // Some upstreams reject systemInstruction without any user turn;
         // degrade the system text into a first user message.
@@ -149,11 +156,10 @@ pub fn build_payload(
 
     // ---- generationConfig (§8.1 / §8.2 / §8.3) ----
     let mut gc = Map::new();
-    let client = ir
-        .generation_config
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
+    let client = match ir.generation_config.take() {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    };
     let sampling_allowed = !profile.sampling_deprecated;
     for key in ["temperature", "topP"] {
         if sampling_allowed {
@@ -262,9 +268,9 @@ mod tests {
             "temperature": 0.7,
             "stopSequences": ["END"]
         });
-        let ir = ir_for("gemini-3.1-pro", gc);
+        let mut ir = ir_for("gemini-3.1-pro", gc);
         let p = build_payload(
-            &ir,
+            &mut ir,
             PortKind::Oai,
             "",
             &modelcaps::profile("gemini-3.1-pro"),
@@ -282,9 +288,9 @@ mod tests {
     #[test]
     fn sampling_deprecated_model_strips_temperature_and_topp() {
         let gc = json!({ "temperature": 0.7, "topP": 0.9 });
-        let ir = ir_for("gemini-3.6-flash", gc);
+        let mut ir = ir_for("gemini-3.6-flash", gc);
         let p = build_payload(
-            &ir,
+            &mut ir,
             PortKind::Oai,
             "",
             &modelcaps::profile("gemini-3.6-flash"),
@@ -298,9 +304,11 @@ mod tests {
     #[test]
     fn oai_port_thinking_uses_forced_then_family_default() {
         // forced empty -> family default (3.1 pro = HIGH).
-        let ir = ir_for("gemini-3.1-pro", json!({}));
+        let mut ir = ir_for("gemini-3.1-pro", json!({}));
+        // build_payload consumes the ir's payload fields: clone for round 2.
+        let mut ir_b = ir.clone();
         let p = build_payload(
-            &ir,
+            &mut ir,
             PortKind::Oai,
             "",
             &modelcaps::profile("gemini-3.1-pro"),
@@ -317,7 +325,7 @@ mod tests {
 
         // forced=minimal on 3.1-pro (no minimal level) -> clamps down to LOW.
         let p = build_payload(
-            &ir,
+            &mut ir_b,
             PortKind::Oai,
             "minimal",
             &modelcaps::profile("gemini-3.1-pro"),
@@ -332,9 +340,11 @@ mod tests {
     #[test]
     fn gemini_port_passthrough_thinking_when_not_forced() {
         let gc = json!({ "thinkingConfig": { "thinkingLevel": "LOW", "includeThoughts": false } });
-        let ir = ir_for("gemini-3.1-pro", gc);
+        let mut ir = ir_for("gemini-3.1-pro", gc);
+        // build_payload consumes the ir's payload fields: clone for round 2.
+        let mut ir_b = ir.clone();
         let p = build_payload(
-            &ir,
+            &mut ir,
             PortKind::Gemini,
             "",
             &modelcaps::profile("gemini-3.1-pro"),
@@ -347,7 +357,7 @@ mod tests {
 
         // forced set -> override.
         let p = build_payload(
-            &ir,
+            &mut ir_b,
             PortKind::Gemini,
             "high",
             &modelcaps::profile("gemini-3.1-pro"),
@@ -365,9 +375,9 @@ mod tests {
 
     #[test]
     fn budget_family_gets_budget_not_level() {
-        let ir = ir_for("gemini-2.5-pro", json!({}));
+        let mut ir = ir_for("gemini-2.5-pro", json!({}));
         let p = build_payload(
-            &ir,
+            &mut ir,
             PortKind::Oai,
             "high",
             &modelcaps::profile("gemini-2.5-pro"),
@@ -379,9 +389,9 @@ mod tests {
         assert!(tc.get("thinkingBudget").is_none());
         assert_eq!(tc["includeThoughts"], true);
 
-        let ir = ir_for("gemini-2.5-flash-lite", json!({}));
+        let mut ir = ir_for("gemini-2.5-flash-lite", json!({}));
         let p = build_payload(
-            &ir,
+            &mut ir,
             PortKind::Oai,
             "",
             &modelcaps::profile("gemini-2.5-flash-lite"),
@@ -392,9 +402,9 @@ mod tests {
 
     #[test]
     fn none_family_has_no_thinking_config() {
-        let ir = ir_for("gemini-2.0-flash", json!({}));
+        let mut ir = ir_for("gemini-2.0-flash", json!({}));
         let p = build_payload(
-            &ir,
+            &mut ir,
             PortKind::Oai,
             "",
             &modelcaps::profile("gemini-2.0-flash"),
@@ -410,7 +420,7 @@ mod tests {
         // Replace the user turn with a model turn: no user turn anywhere.
         ir.contents = vec![json!({"role": "model", "parts": [{"text": "ok"}]})];
         let p = build_payload(
-            &ir,
+            &mut ir,
             PortKind::Oai,
             "",
             &modelcaps::profile("gemini-3.1-pro"),
@@ -427,7 +437,7 @@ mod tests {
         let mut ir = ir_for("gemini-3.1-pro", json!({}));
         ir.system = Some(json!({ "parts": [{ "text": "be nice" }] }));
         let p = build_payload(
-            &ir,
+            &mut ir,
             PortKind::Oai,
             "",
             &modelcaps::profile("gemini-3.1-pro"),

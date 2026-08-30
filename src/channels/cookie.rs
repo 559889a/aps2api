@@ -8,7 +8,7 @@
 //! Auth (SAPISIDHASH x3) is recomputed for EVERY request and retry, with all
 //! three segments from one `now()` instant (spec traps 1-2).
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use wreq_util::{Emulation, Platform, Profile};
 
@@ -99,28 +99,37 @@ impl CookieClient {
         )
     }
 
-    /// GraphQL shell (§6.3) around the rewritten Gemini payload. Only the
-    /// whitelisted fields (contents/systemInstruction/safetySettings/
-    /// generationConfig) are copied into variables.
-    fn build_shell(&self, payload: &Value, model: &str) -> Value {
-        let mut variables = Map::new();
-        variables.insert("model".into(), json!(self.model_path(model)));
+    /// Serialize the §6.3 GraphQL shell around the rewritten payload. The
+    /// whitelisted payload fields are serialized STRAIGHT from the borrowed
+    /// payload — the contents array (base64 images reach several MB) is never
+    /// deep-cloned. Field order matches the verified request shape.
+    fn build_body(&self, payload: &Value, model: &str) -> String {
+        let mut out = String::with_capacity(4096);
+        out.push_str("{\"requestContext\":");
+        out.push_str(&self.request_context().to_string());
+        out.push_str(",\"querySignature\":");
+        out.push_str(&serde_json::to_string(QUERY_SIGNATURE).unwrap_or_default());
+        out.push_str(",\"operationName\":\"StreamGenerateContent\",\"variables\":{\"model\":");
+        out.push_str(&serde_json::to_string(&self.model_path(model)).unwrap_or_default());
         for key in [
             "contents",
             "systemInstruction",
             "safetySettings",
             "generationConfig",
         ] {
-            if let Some(v) = payload.get(key) {
-                variables.insert(key.to_string(), v.clone());
-            }
+            let Some(v) = payload.get(key) else {
+                continue;
+            };
+            let Ok(frag) = serde_json::to_string(v) else {
+                continue;
+            };
+            out.push_str(",\"");
+            out.push_str(key);
+            out.push_str("\":");
+            out.push_str(&frag);
         }
-        json!({
-            "requestContext": self.request_context(),
-            "querySignature": QUERY_SIGNATURE,
-            "operationName": "StreamGenerateContent",
-            "variables": Value::Object(variables),
-        })
+        out.push_str("}}");
+        out
     }
 
     /// The §6.2 header set, in fixed order, rebuilt for every attempt.
@@ -165,7 +174,7 @@ impl CookieClient {
         // batchGraphql has a single operation (StreamGenerateContent);
         // non-streaming is aggregated from the same event stream (§7.2).
         crate::channels::express::log_outbound(payload);
-        let body = self.build_shell(payload, model).to_string();
+        let body = self.build_body(payload, model);
         let resp = self
             .http
             .post(BATCHGRAPHQL_URL)
@@ -274,7 +283,7 @@ mod tests {
             "generationConfig": {},
             "sneakyExtra": 1
         });
-        let shell = c.build_shell(&payload, "gemini-3.1-pro");
+        let shell: Value = serde_json::from_str(&c.build_body(&payload, "gemini-3.1-pro")).unwrap();
         assert_eq!(shell["operationName"], "StreamGenerateContent");
         assert_eq!(shell["querySignature"], QUERY_SIGNATURE);
         let rc = &shell["requestContext"];
