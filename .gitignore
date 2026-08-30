@@ -14,3 +14,6 @@ docs/
 *.tmp
 msvc-dev.cmd
 vs-fix.cmd
+
+# 本地解压的 Release 产物（含拷入的真实 config.yaml 与 exe，永不入库）
+/aps2api-v*/
