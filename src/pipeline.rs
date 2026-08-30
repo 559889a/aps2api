@@ -9,6 +9,7 @@
 //! - client disconnect aborts retries and upstream reads (mpsc send failure).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use serde_json::Value;
@@ -87,6 +88,57 @@ async fn backoff_sleep(cfg: &Config, attempt: u32) {
     .await;
 }
 
+/// Log tag for the channel (the enum has no Display impl).
+fn channel_name(channel: Channel) -> &'static str {
+    match channel {
+        Channel::Express => "express",
+        Channel::Cookie => "cookie",
+    }
+}
+
+/// Retry visibility (owner request 2026-08-30): every retry decision must be
+/// plainly visible in the log — which retry of how many, the backoff delay
+/// about to run, and why. Without this a silent retry loop is impossible to
+/// distinguish from a hung upstream.
+fn log_retry(channel: Channel, model: &str, retry_no: u32, max: u32, delay_secs: u64, error: &str) {
+    tracing::warn!(
+        channel = channel_name(channel),
+        model = %model,
+        retry = retry_no,
+        max = max,
+        delay_secs = delay_secs,
+        "upstream attempt failed; retrying ({error})"
+    );
+}
+
+/// Terminal upstream failure about to reach the client (no retry possible or
+/// budget gone). `emitted` distinguishes the never-retry-after-output red
+/// line (§12.3) from an exhausted budget.
+fn log_give_up(
+    channel: Channel,
+    model: &str,
+    retries_used: u32,
+    max: u32,
+    emitted: bool,
+    e: &UpstreamError,
+) {
+    let why = if !e.retryable() {
+        "non-retryable"
+    } else if emitted {
+        "content already emitted; retry forbidden"
+    } else {
+        "retry budget exhausted"
+    };
+    tracing::error!(
+        channel = channel_name(channel),
+        model = %model,
+        retries_used = retries_used,
+        max = max,
+        error = %e.message,
+        "upstream failed ({why}); returning the error to the client"
+    );
+}
+
 /// Streaming execution: spawns the retry pump, returns the receiver the axum
 /// body streams from. Each element is a wire-ready byte segment.
 pub async fn run_stream(
@@ -121,6 +173,8 @@ pub async fn run_stream(
         let mut attempt: u32 = 0; // retries used so far
         let mut emitted = false;
         'outer: loop {
+            // TTFB baseline: reset per attempt (a retry restarts the clock).
+            let started = Instant::now();
             // Each attempt rebuilds the request inside start(): cookie
             // regenerates requestContext + SAPISIDHASH; express rebuilds the
             // request object (body is time-independent, §12.3).
@@ -129,6 +183,14 @@ pub async fn run_stream(
                 Err(e) => {
                     if !emitted && e.retryable() && attempt < cfg.retry.max {
                         attempt += 1;
+                        log_retry(
+                            channel,
+                            &model,
+                            attempt,
+                            cfg.retry.max,
+                            retry::retry_delay(&cfg.retry, attempt),
+                            &e.message,
+                        );
                         if !retry::wait_with_heartbeat(
                             retry::retry_delay(&cfg.retry, attempt),
                             true,
@@ -140,6 +202,7 @@ pub async fn run_stream(
                         }
                         continue 'outer;
                     }
+                    log_give_up(channel, &model, attempt, cfg.retry.max, emitted, &e);
                     for b in em.on_error(&e) {
                         if tx.send(Ok(b)).await.is_err() {
                             return;
@@ -157,6 +220,14 @@ pub async fn run_stream(
                 Err(_elapsed) => {
                     if !emitted && attempt < cfg.retry.max {
                         attempt += 1;
+                        log_retry(
+                            channel,
+                            &model,
+                            attempt,
+                            cfg.retry.max,
+                            retry::retry_delay(&cfg.retry, attempt),
+                            "no first event within the first-response budget (30s)",
+                        );
                         if !retry::wait_with_heartbeat(
                             retry::retry_delay(&cfg.retry, attempt),
                             true,
@@ -173,6 +244,7 @@ pub async fn run_stream(
                         status: None,
                         message: "upstream did not produce any content within the first-response budget (30s)".into(),
                     };
+                    log_give_up(channel, &model, attempt, cfg.retry.max, false, &e);
                     for b in em.on_error(&e) {
                         if tx.send(Ok(b)).await.is_err() {
                             return;
@@ -181,6 +253,21 @@ pub async fn run_stream(
                     return;
                 }
             };
+
+            // TTFB visibility (owner request 2026-08-30): time to the FIRST
+            // semantic upstream event, logged for every successful response.
+            // Bypass logs none (its upstream is non-streaming — no first
+            // token to time).
+            if let Some(ev) = &first {
+                if !matches!(ev, Ev::Error(_)) {
+                    tracing::info!(
+                        channel = channel_name(channel),
+                        model = %model,
+                        ttfb_ms = started.elapsed().as_millis() as u64,
+                        "upstream first response"
+                    );
+                }
+            }
 
             let mut next = first;
             loop {
@@ -196,6 +283,14 @@ pub async fn run_stream(
                 if let Ev::Error(e) = ev {
                     if !emitted && e.retryable() && attempt < cfg.retry.max {
                         attempt += 1;
+                        log_retry(
+                            channel,
+                            &model,
+                            attempt,
+                            cfg.retry.max,
+                            retry::retry_delay(&cfg.retry, attempt),
+                            &e.message,
+                        );
                         if !retry::wait_with_heartbeat(
                             retry::retry_delay(&cfg.retry, attempt),
                             true,
@@ -207,6 +302,7 @@ pub async fn run_stream(
                         }
                         continue 'outer;
                     }
+                    log_give_up(channel, &model, attempt, cfg.retry.max, emitted, &e);
                     for b in em.on_error(&e) {
                         if tx.send(Ok(b)).await.is_err() {
                             return;
@@ -247,14 +343,25 @@ pub async fn run_nonstream(
     let mut attempt: u32 = 0;
     let mut emitted = false;
     'outer: loop {
+        // TTFB baseline: reset per attempt (a retry restarts the clock).
+        let started = Instant::now();
         let mut stream = match client.start(&payload, &model, false).await {
             Ok(s) => s,
             Err(e) => {
                 if !emitted && e.retryable() && attempt < cfg.retry.max {
                     attempt += 1;
+                    log_retry(
+                        channel,
+                        &model,
+                        attempt,
+                        cfg.retry.max,
+                        retry::retry_delay(&cfg.retry, attempt),
+                        &e.message,
+                    );
                     backoff_sleep(&cfg, attempt).await;
                     continue 'outer;
                 }
+                log_give_up(channel, &model, attempt, cfg.retry.max, emitted, &e);
                 return Err(e);
             }
         };
@@ -264,16 +371,39 @@ pub async fn run_nonstream(
             Err(_) => {
                 if !emitted && attempt < cfg.retry.max {
                     attempt += 1;
+                    log_retry(
+                        channel,
+                        &model,
+                        attempt,
+                        cfg.retry.max,
+                        retry::retry_delay(&cfg.retry, attempt),
+                        "no first event within the first-response budget (30s)",
+                    );
                     backoff_sleep(&cfg, attempt).await;
                     continue 'outer;
                 }
-                return Err(UpstreamError {
+                let e = UpstreamError {
                     kind: ErrorKind::Transport,
                     status: None,
                     message: "upstream did not produce any content within the first-response budget (30s)".into(),
-                });
+                };
+                log_give_up(channel, &model, attempt, cfg.retry.max, false, &e);
+                return Err(e);
             }
         };
+        // TTFB visibility (owner request 2026-08-30): even non-streaming
+        // replies are aggregated from the upstream's event stream, so the
+        // first event IS the first token. Bypass logs none (§9.5).
+        if let Some(ev) = &first {
+            if !matches!(ev, Ev::Error(_)) {
+                tracing::info!(
+                    channel = channel_name(channel),
+                    model = %model,
+                    ttfb_ms = started.elapsed().as_millis() as u64,
+                    "upstream first response"
+                );
+            }
+        }
         let mut next = first;
         loop {
             let Some(ev) = next else {
@@ -282,9 +412,18 @@ pub async fn run_nonstream(
             if let Ev::Error(e) = ev {
                 if !emitted && e.retryable() && attempt < cfg.retry.max {
                     attempt += 1;
+                    log_retry(
+                        channel,
+                        &model,
+                        attempt,
+                        cfg.retry.max,
+                        retry::retry_delay(&cfg.retry, attempt),
+                        &e.message,
+                    );
                     backoff_sleep(&cfg, attempt).await;
                     continue 'outer;
                 }
+                log_give_up(channel, &model, attempt, cfg.retry.max, emitted, &e);
                 return Err(e);
             }
             emitted = true;
@@ -303,7 +442,10 @@ pub async fn run_nonstream(
 /// upstream response has arrived, the aggregated events are flushed through
 /// the normal streaming emitter in one burst (role chunk → content →
 /// finish → [DONE]). Heartbeats never count as emitted content (§12.3), so
-/// retryable upstream failures keep their full retry budget.
+/// retryable upstream failures keep their full retry budget. Retry
+/// decisions are logged like every other path; there is deliberately NO
+/// TTFB log here — the upstream request is non-streaming, so there is no
+/// first token to time (owner request 2026-08-30).
 pub async fn run_bypass(
     ctx: &Ctx,
     ir: &crate::ir::Ir,
@@ -353,6 +495,14 @@ pub async fn run_bypass(
                     Ok(Err(e)) => {
                         if e.retryable() && attempt < cfg.retry.max {
                             attempt += 1;
+                            log_retry(
+                                Channel::Express,
+                                &model,
+                                attempt,
+                                cfg.retry.max,
+                                retry::retry_delay(&cfg.retry, attempt),
+                                &e.message,
+                            );
                             if !retry::wait_with_heartbeat(
                                 retry::retry_delay(&cfg.retry, attempt),
                                 true,
@@ -364,6 +514,7 @@ pub async fn run_bypass(
                             }
                             continue 'outer;
                         }
+                        log_give_up(Channel::Express, &model, attempt, cfg.retry.max, false, &e);
                         for b in em.on_error(&e) {
                             if tx.send(Ok(b)).await.is_err() {
                                 return;
@@ -376,6 +527,14 @@ pub async fn run_bypass(
                         if waited >= retry::BYPASS_FIRST_RESPONSE_BUDGET {
                             if attempt < cfg.retry.max {
                                 attempt += 1;
+                                log_retry(
+                                    Channel::Express,
+                                    &model,
+                                    attempt,
+                                    cfg.retry.max,
+                                    retry::retry_delay(&cfg.retry, attempt),
+                                    "no response within the bypass first-response budget",
+                                );
                                 if !retry::wait_with_heartbeat(
                                     retry::retry_delay(&cfg.retry, attempt),
                                     true,
@@ -396,6 +555,14 @@ pub async fn run_bypass(
                                     retry::BYPASS_FIRST_RESPONSE_BUDGET.as_secs()
                                 ),
                             };
+                            log_give_up(
+                                Channel::Express,
+                                &model,
+                                attempt,
+                                cfg.retry.max,
+                                false,
+                                &e,
+                            );
                             for b in em.on_error(&e) {
                                 if tx.send(Ok(b)).await.is_err() {
                                     return;
@@ -483,6 +650,14 @@ pub async fn run_bypass(
             // §12.3 red line still allows retrying.
             if e.retryable() && attempt < cfg.retry.max {
                 attempt += 1;
+                log_retry(
+                    Channel::Express,
+                    &model,
+                    attempt,
+                    cfg.retry.max,
+                    retry::retry_delay(&cfg.retry, attempt),
+                    &e.message,
+                );
                 if !retry::wait_with_heartbeat(retry::retry_delay(&cfg.retry, attempt), true, &tx)
                     .await
                 {
@@ -490,6 +665,7 @@ pub async fn run_bypass(
                 }
                 continue 'outer;
             }
+            log_give_up(Channel::Express, &model, attempt, cfg.retry.max, false, &e);
             for b in em.on_error(&e) {
                 if tx.send(Ok(b)).await.is_err() {
                     return;
