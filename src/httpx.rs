@@ -13,6 +13,26 @@ use std::time::Duration;
 
 use crate::config::Config;
 
+/// Force PROXY-SIDE DNS resolution for every configured proxy: `socks5://`
+/// is normalized to `socks5h://` semantics (credentials and case preserved).
+///
+/// Verified on the dev machine (2026-08-30): with a local chaining entry,
+/// local resolution fails the connect entirely (the device's own resolver
+/// path is involved, which also means DNS queries leak to the local
+/// network's resolver), while proxy-side resolution works. Proxy-side
+/// resolution is also strictly better for the fixed-exit disguise: the
+/// device's DNS never participates in upstream routing (spec §1.4).
+pub fn proxied_url(url: &str) -> String {
+    // "socks5://" is 9 chars; "socks5h://" is 10.
+    if url.len() >= 9 {
+        let (scheme, rest) = url.split_at(9);
+        if scheme.eq_ignore_ascii_case("socks5://") {
+            return format!("socks5h://{rest}");
+        }
+    }
+    url.to_string()
+}
+
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// reqwest client for the express channel.
@@ -23,7 +43,9 @@ pub fn build_express_client(cfg: &Config) -> Result<reqwest::Client, String> {
         // source of truth for outbound routing (spec §1.4).
         .no_proxy();
     if let Some(url) = &cfg.socks5 {
-        let p = reqwest::Proxy::all(url).map_err(|e| format!("invalid socks5 url {url:?}: {e}"))?;
+        let resolved = proxied_url(url);
+        let p = reqwest::Proxy::all(&resolved)
+            .map_err(|e| format!("invalid socks5 url {url:?}: {e}"))?;
         builder = builder.proxy(p);
     }
     builder
@@ -41,7 +63,9 @@ pub fn build_cookie_client(cfg: &Config) -> Result<wreq::Client, String> {
         // state it explicitly so the invariant survives feature changes.
         .no_proxy();
     if let Some(url) = &cfg.socks5 {
-        let p = wreq::Proxy::all(url).map_err(|e| format!("invalid socks5 url {url:?}: {e}"))?;
+        let resolved = proxied_url(url);
+        let p =
+            wreq::Proxy::all(&resolved).map_err(|e| format!("invalid socks5 url {url:?}: {e}"))?;
         builder = builder.proxy(p);
     }
     builder
@@ -57,7 +81,9 @@ pub fn build_image_client(cfg: &Config) -> Result<reqwest::Client, String> {
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy();
     if let Some(url) = &cfg.socks5 {
-        let p = reqwest::Proxy::all(url).map_err(|e| format!("invalid socks5 url {url:?}: {e}"))?;
+        let resolved = proxied_url(url);
+        let p = reqwest::Proxy::all(&resolved)
+            .map_err(|e| format!("invalid socks5 url {url:?}: {e}"))?;
         builder = builder.proxy(p);
     }
     builder
@@ -99,6 +125,22 @@ mod tests {
         // for the `socks5` config field is enforced by config::validate.
         let cfg = cfg_with_socks("http://127.0.0.1:7890");
         assert!(build_express_client(&cfg).is_ok());
+    }
+
+    #[test]
+    fn socks5_urls_normalize_to_proxy_side_resolution() {
+        assert_eq!(
+            proxied_url("socks5://127.0.0.1:7890"),
+            "socks5h://127.0.0.1:7890"
+        );
+        // Credentials and their case must survive untouched.
+        assert_eq!(
+            proxied_url("socks5://User:Pw@10.0.0.1:1080"),
+            "socks5h://User:Pw@10.0.0.1:1080"
+        );
+        // Uppercase scheme accepted; socks5h stays as-is.
+        assert_eq!(proxied_url("SOCKS5://h:1"), "socks5h://h:1");
+        assert_eq!(proxied_url("socks5h://h:1"), "socks5h://h:1");
     }
 
     #[test]

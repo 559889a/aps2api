@@ -99,8 +99,11 @@ All settings live in `config.yaml` next to the binary; see the heavily commented
 Exposed models come from `model.json` (`models` list + optional `alias_map` for
 request-name → real-model rewriting).
 
-DNS resolution for proxied connections is performed by the proxy library at connect time
-(local resolution, standard SOCKS5 behavior for reqwest/tokio-socks).
+DNS resolution for proxied connections is always performed by the PROXY (socks5h
+semantics — `socks5://` is normalized internally): the device's own resolver never
+participates in upstream routing, which both keeps the fixed-exit disguise airtight and
+avoids broken/polluted local DNS. Verified against a local chaining entry where local
+resolution fails entirely and proxy-side resolution works.
 
 ## API Endpoints
 
