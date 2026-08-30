@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install BoringSSL build dependencies (linux)
-        if: runner.os == 'Linux' && !matrix.android
+        if: ${{ runner.os == 'Linux' && !matrix.android }}
         run: sudo apt-get update && sudo apt-get install -y cmake perl nasm libclang-dev
 
       - name: Install BoringSSL build dependencies (android)
@@ -77,7 +77,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build (native)
-        if: !matrix.android
+        if: ${{ !matrix.android }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Build (android aarch64, API 24+)
