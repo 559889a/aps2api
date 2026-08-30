@@ -72,7 +72,10 @@ pub fn build_express_client(cfg: &Config) -> Result<reqwest::Client, String> {
         // Never touch HTTP(S)_PROXY env vars: config.yaml is the single
         // source of truth for outbound routing (spec §1.4).
         .no_proxy()
-        .tls_backend_preconfigured(Some(express_tls()?));
+        // Takes the bare ClientConfig: the builder wraps it in its own
+        // Option before downcasting (passing Some() breaks the downcast and
+        // the build fails with "Unknown TLS backend").
+        .tls_backend_preconfigured(express_tls()?);
     if let Some(url) = &cfg.socks5 {
         let resolved = proxied_url(url);
         let p = reqwest::Proxy::all(&resolved)
@@ -111,7 +114,7 @@ pub fn build_image_client(cfg: &Config) -> Result<reqwest::Client, String> {
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
-        .tls_backend_preconfigured(Some(express_tls()?));
+        .tls_backend_preconfigured(express_tls()?);
     if let Some(url) = &cfg.socks5 {
         let resolved = proxied_url(url);
         let p = reqwest::Proxy::all(&resolved)
