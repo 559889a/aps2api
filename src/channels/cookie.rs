@@ -23,10 +23,20 @@ use crate::sapisid;
 /// these first and re-capture from DevTools.
 const BATCHGRAPHQL_URL: &str = "https://cloudconsole-pa.clients6.google.com\
 /v3/entityServices/AiplatformEntityService/schemas/AIPLATFORM_GRAPHQL:batchGraphql\
-?key=AIzaSyCI-zsRP85UVOi0DjtiCwHBwQ1djDy741g&prettyPrint=false";
+?key=AIzaSyCI-zsRP85UVOi0DjtiCwWBwQ1djDy741g&prettyPrint=false";
 const QUERY_SIGNATURE: &str = "2/VMwZooA0XN10Wuu2r5N9Hw+S9X+WG4G8k423Pl7/oqw=";
 const CLIENT_VERSION: &str = "boq_cloud-boq-clientweb-vertexaistudio_20260609.06_p0";
 const ORIGIN: &str = "https://console.cloud.google.com";
+
+// RED LINE (live-tested 2026-08-30): do NOT send an `x-origin` header. The
+// endpoint's XD3 check rejects the request with
+// "Bad request: Origin doesn't match Host for XD3." the moment `x-origin`
+// is present (bisected: the same request passes 200 without it and fails
+// 400 with it — UA / sec-fetch / sec-ch-ua / accept-* are all harmless).
+// The spec's §6.2 header list previously included it from a browser
+// capture; a real browser session passes XD3 by a different mechanism and
+// direct connections must not send it. The reference project's verified
+// 8-header set omits it.
 
 /// Chrome149 Windows companion values — copied verbatim from the wreq-util
 /// 0.2.0 preset (spec §6.2: never invent, never rotate at runtime). Must be
@@ -132,7 +142,7 @@ impl CookieClient {
             "authorization",
             &sapisid::authorization_header(&self.cookie),
         );
-        put("x-origin", ORIGIN);
+        // No `x-origin` here — see the XD3 red-line note above.
         put("origin", ORIGIN);
         put("referer", "https://console.cloud.google.com/");
         put("accept", "*/*");
@@ -178,6 +188,7 @@ impl CookieClient {
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             let text = resp.text().await.unwrap_or_default();
+            tracing::debug!(status, upstream_body = %text, "batchGraphql non-2xx");
             return Err(errs::classify_error(
                 Some(status),
                 cookie_error_message(&text),
@@ -204,6 +215,7 @@ pub fn cookie_extract(obj: &Value, out: &mut Vec<Ev>) {
         for r in results {
             if let Some(errs) = r.get("errors").and_then(Value::as_array) {
                 if let Some(first) = errs.first() {
+                    tracing::debug!(error_item = %first, "batchGraphql in-stream error");
                     out.push(Ev::Error(error_from_value(first)));
                     continue;
                 }
@@ -295,6 +307,35 @@ mod tests {
         let sa = a["clientSessionId"].as_str().unwrap();
         let sb = b["clientSessionId"].as_str().unwrap();
         assert_ne!(sa, sb, "clientSessionId must be regenerated per request");
+    }
+
+    #[test]
+    fn header_set_matches_verified_reference_and_never_sends_x_origin() {
+        let c = CookieClient::new(
+            wreq::Client::builder().build().unwrap(),
+            &CookieConfig {
+                cookie: "SAPISID=x".into(),
+                project_id: "p".into(),
+                experiment_flags: String::new(),
+            },
+        );
+        let names: Vec<String> = c.headers().keys().map(|k| k.as_str().to_string()).collect();
+        for required in [
+            "authorization",
+            "cookie",
+            "content-type",
+            "x-goog-authuser",
+            "x-same-domain",
+            "origin",
+            "referer",
+            "user-agent",
+        ] {
+            assert!(names.contains(&required.to_string()), "missing {required}");
+        }
+        assert!(
+            !names.iter().any(|n| n == "x-origin"),
+            "x-origin triggers XD3 rejection"
+        );
     }
 
     #[test]
