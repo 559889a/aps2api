@@ -184,18 +184,7 @@ impl CookieClient {
             .body(body)
             .send()
             .await
-            .map_err(|e| {
-                let message = e.to_string();
-                if message.to_lowercase().contains("timeout") {
-                    UpstreamError {
-                        kind: ErrorKind::Transport,
-                        status: None,
-                        message,
-                    }
-                } else {
-                    errs::classify_error(None, message)
-                }
-            })?;
+            .map_err(map_send_err)?;
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             let text = resp.text().await.unwrap_or_default();
@@ -212,6 +201,27 @@ impl CookieClient {
             cookie_extract,
         ));
         Ok(EvStream::new(rx))
+    }
+}
+
+/// Transport failures before/while the request runs are retryable (§12.1).
+/// wreq connect failures (proxy down / DNS / connection refused) do NOT
+/// carry the word "timeout" in their message — decide by error TYPE, the
+/// same way the express channel does with `reqwest::Error::is_connect()`
+/// (2026-08-30 fix: string-only matching misfiled them as terminal Invalid).
+fn map_send_err(e: wreq::Error) -> UpstreamError {
+    classify_send_failure(e.is_connect(), e.is_timeout(), e.to_string())
+}
+
+fn classify_send_failure(is_connect: bool, is_timeout: bool, message: String) -> UpstreamError {
+    if is_connect || is_timeout || message.to_lowercase().contains("timeout") {
+        UpstreamError {
+            kind: ErrorKind::Transport,
+            status: None,
+            message,
+        }
+    } else {
+        errs::classify_error(None, message)
     }
 }
 
@@ -391,5 +401,24 @@ mod tests {
         let mut out = Vec::new();
         cookie_extract(&obj, &mut out);
         assert!(matches!(&out[0], Ev::Error(e) if e.kind == ErrorKind::Auth));
+    }
+
+    #[test]
+    fn send_failure_classification_makes_connect_errors_retryable() {
+        // wreq connect errors (proxy down / DNS / refused) carry no "timeout"
+        // wording — they must still classify as retryable Transport (§12.1),
+        // not as terminal Invalid.
+        let e = classify_send_failure(true, false, "error sending request for url".into());
+        assert_eq!(e.kind, ErrorKind::Transport);
+        assert!(e.retryable());
+        let e = classify_send_failure(false, true, "operation timed out".into());
+        assert_eq!(e.kind, ErrorKind::Transport);
+        // Wording fallback still works when the type flags are absent.
+        let e = classify_send_failure(false, false, "request timeout".into());
+        assert_eq!(e.kind, ErrorKind::Transport);
+        // Non-transport send failures keep the §14 classification.
+        let e = classify_send_failure(false, false, "body decode error".into());
+        assert_ne!(e.kind, ErrorKind::Transport);
+        assert!(!e.retryable());
     }
 }
