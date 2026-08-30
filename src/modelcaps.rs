@@ -211,6 +211,18 @@ mod tests {
     }
 
     #[test]
+    fn gemini_3_1_pro_preview() {
+        // Live model name (user-verified 2026-08-30): preview suffix must not
+        // affect family parsing; pro defaults stay.
+        let p = profile("gemini-3.1-pro-preview");
+        assert_eq!(p.thinking, ThinkingKind::Level);
+        assert_eq!(level_levels(&p), ["low", "medium", "high"]);
+        assert_eq!(p.default_level, "high");
+        assert!(!p.sampling_deprecated);
+        assert!(p.requires_user_last_turn);
+    }
+
+    #[test]
     fn gemini_3_6_flash() {
         let p = profile("gemini-3.6-flash");
         assert_eq!(level_levels(&p), ["minimal", "low", "medium", "high"]);
