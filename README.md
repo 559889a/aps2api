@@ -66,10 +66,13 @@ behind your own VPN/clash).
 ### Termux (Android)
 
 The Termux build is a native `aarch64-linux-android` binary (bionic libc — not a glibc
-Linux build). Ports are >1024; the binary reads `config.yaml`/`model.json` from its own
-directory; Android has no `/etc/resolv.conf`, so DNS goes through the system resolver.
+Linux build). It links against `libc++_shared.so`, which Termux provides through its
+`libc++` package — install that once before the first run. Ports are >1024; the binary
+reads `config.yaml`/`model.json` from its own directory; Android has no
+`/etc/resolv.conf`, so DNS goes through the system resolver.
 
 ```bash
+pkg install libc++              # provides libc++_shared.so required by the binary
 chmod +x aps2api
 ./aps2api                      # config.yaml + model.json live next to the binary
 
