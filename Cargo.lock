@@ -56,6 +56,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures-util",
+ "percent-encoding",
  "rand",
  "reqwest",
  "serde",

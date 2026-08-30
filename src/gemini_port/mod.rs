@@ -82,7 +82,12 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
         });
     };
 
-    // Split "model:operation" (model may itself contain '/').
+    // Percent-decode (clients may encode the '/' of channel prefixes as %2F),
+    // then split "model:operation" (model may itself contain '/').
+    let after = percent_encoding::percent_decode_str(after)
+        .decode_utf8()
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| after.to_string());
     let (model, op) = match after.rsplit_once(':') {
         Some(pair) => pair,
         None => {
@@ -93,22 +98,17 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
                     message: "method not allowed for model info".into(),
                 });
             }
-            return match oai::resolve_model_name(
-                &state.models.alias_map,
-                &state.models.models,
-                after,
-            ) {
+            return match resolve_and_info(&state, &after) {
                 Ok(name) => single_model(&name),
                 Err(e) => gemini_error(e),
             };
         }
     };
 
-    let ok_model =
-        match oai::resolve_model_name(&state.models.alias_map, &state.models.models, model) {
-            Ok(m) => m,
-            Err(e) => return gemini_error(e),
-        };
+    let ok_model = match resolve_and_info(&state, model) {
+        Ok(m) => m,
+        Err(e) => return gemini_error(e),
+    };
 
     let body = match read_json_body(req).await {
         Ok(b) => b,
@@ -123,6 +123,12 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
             message: format!("unsupported operation {other:?}"),
         }),
     }
+}
+
+/// Strip any channel prefix, resolve aliases, and 404 on unknown models.
+fn resolve_and_info(state: &AppState, model: &str) -> Result<String, ApiError> {
+    let (bare, _forced) = crate::ir::split_channel_prefix(model);
+    oai::resolve_model_name(&state.models.alias_map, &state.models.models, &bare)
 }
 
 async fn read_json_body(req: Request) -> Result<Value, ApiError> {
