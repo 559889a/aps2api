@@ -20,7 +20,8 @@ the response back in the client's protocol.
 - **Dual upstream channels** — Express (official endpoint, API-key auth) and cookie
   (console batchGraphql direct with full Chrome TLS/HTTP2 fingerprint emulation via
   `wreq`, three-layer anti-detection: TLS fingerprint, browser header set, session
-  context). Pick a channel per request with an `express/` or `cookie/` model-name prefix.
+  context). Pick a channel per request with an `express/` or `cookie/` model-name
+  prefix — honored on **both** the OpenAI and the Gemini-native endpoint.
 - **Payload rebuilding (never pass-through)** — penalty parameters, `top_k`, and
   `max_tokens` are stripped, thinking level is overridden per configuration, and a
   channel-specific safety-settings block is injected on every request.
@@ -28,7 +29,12 @@ the response back in the client's protocol.
   server-side with SSRF protection).
 - **Prefill compatibility** — trailing assistant messages are kept and completed
   (unclosed thinking-tag guard included), so SillyTavern-style presets work on models
-  that reject them.
+  that reject them; the response side stitches the prefill back so the client sees one
+  continuous completion.
+- **Thought/reasoning transparency** — model thinking survives intact: separate
+  `reasoning_content` on the OpenAI endpoint, `thought: true` parts on the Gemini
+  endpoint. A stream that ends without any visible content gets a clear diagnostic
+  message instead of a silent empty reply.
 - **Automatic retry** — on upstream 429/50x and transient stream errors, with
   fixed-interval or linear-backoff strategy, SSE keep-alive heartbeats while waiting,
   and a strict never-retry-after-emitting guarantee.
@@ -127,6 +133,10 @@ resolution fails entirely and proxy-side resolution works.
 | POST | `/v1beta/models/{model}:generateContent` | Gemini generate (JSON) |
 | POST | `/v1beta/models/{model}:streamGenerateContent` | Gemini streaming (SSE; `?alt=sse` accepted and ignored) |
 
+`{model}` may carry an `express/` or `cookie/` channel prefix on both the OpenAI and
+the Gemini-native endpoint (and `fake-streaming/express/` bypass aliases when
+`bypass: true`), e.g. `cookie/gemini-3.6-flash:streamGenerateContent`.
+
 Auth for every endpoint except `/health`: `Authorization: Bearer <api_key>` or
 `x-goog-api-key: <api_key>`.
 
@@ -149,7 +159,7 @@ aps2api/
     ├── config.rs                    # config.yaml / model.json loading and validation
     ├── errs.rs                      # upstream error taxonomy (§14) + user-facing hints
     ├── gemini_port/
-    │   ├── mod.rs                   # /v1beta dispatch: prefix stripping, %2F decode, routes
+    │   ├── mod.rs                   # /v1beta dispatch: %2F decode, prefix pass-through, routes
     │   ├── parse.rs                 # Gemini request normalization -> ir (§10.2)
     │   └── emit.rs                  # events -> SSE chunks / aggregated response (§10.3)
     ├── httpx.rs                     # outbound clients: reqwest (express) + wreq (cookie), socks5h
