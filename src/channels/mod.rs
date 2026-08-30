@@ -205,6 +205,21 @@ fn thought_flag(part: &Value) -> bool {
     }
 }
 
+/// True when `part[key]` exists and carries any non-empty value at any depth
+/// (batchGraphql proto3 shells hold empty strings/objects for every field).
+fn shell_part_nonempty(part: &Value, key: &str) -> bool {
+    fn any_nonempty(v: &Value) -> bool {
+        match v {
+            Value::Null => false,
+            Value::String(s) => !s.is_empty(),
+            Value::Object(m) => m.values().any(any_nonempty),
+            Value::Array(a) => a.iter().any(any_nonempty),
+            _ => true,
+        }
+    }
+    part.get(key).is_some_and(any_nonempty)
+}
+
 /// Unified chunk extraction (spec §13.2): one standard Gemini chunk ->
 /// zero or more events. `*_UNSPECIFIED` proto defaults are filtered.
 pub fn extract_from_chunk(chunk: &Value, out: &mut Vec<Ev>) {
@@ -231,16 +246,13 @@ pub fn extract_from_chunk(chunk: &Value, out: &mut Vec<Ev>) {
                 .and_then(Value::as_array)
             {
                 for part in parts {
-                    if let Some(name) = part.get("functionCall").and_then(|fc| fc.get("name")) {
-                        tracing::debug!(function = %name, "dropped functionCall part (no tool support)");
-                        continue;
-                    }
-                    if part.get("executableCode").is_some()
-                        || part.get("codeExecutionResult").is_some()
-                    {
-                        tracing::debug!("dropped code-execution part (no tool support)");
-                        continue;
-                    }
+                    // batchGraphql parts are proto3-style: EVERY field is
+                    // present with an empty value (functionCall.name="",
+                    // inlineData:{mimeType:"",data:""}, executableCode with
+                    // enum-default strings, ...). Text extraction runs FIRST
+                    // so shell fields can never swallow real content;
+                    // tool/code/image fields only count when they carry
+                    // actual content (live-tested 2026-08-30).
                     if let Some(text) = part.get("text").and_then(Value::as_str) {
                         if !text.is_empty() {
                             if thought_flag(part) {
@@ -248,18 +260,36 @@ pub fn extract_from_chunk(chunk: &Value, out: &mut Vec<Ev>) {
                             } else {
                                 out.push(Ev::Text(text.to_string()));
                             }
+                            continue;
                         }
+                    }
+                    if part
+                        .get("functionCall")
+                        .and_then(|fc| fc.get("name"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|n| !n.is_empty())
+                    {
+                        tracing::debug!("dropped functionCall part (no tool support)");
+                        continue;
                     }
                     if let Some(inline) = part.get("inlineData") {
                         if let (Some(mime), Some(data)) = (
                             inline.get("mimeType").and_then(Value::as_str),
                             inline.get("data").and_then(Value::as_str),
                         ) {
-                            out.push(Ev::Image {
-                                mime: mime.to_string(),
-                                b64: data.to_string(),
-                            });
+                            if !mime.is_empty() && !data.is_empty() {
+                                out.push(Ev::Image {
+                                    mime: mime.to_string(),
+                                    b64: data.to_string(),
+                                });
+                                continue;
+                            }
                         }
+                    }
+                    if shell_part_nonempty(part, "executableCode")
+                        || shell_part_nonempty(part, "codeExecutionResult")
+                    {
+                        tracing::debug!("dropped code-execution part (no tool support)");
                     }
                 }
             }
@@ -344,6 +374,42 @@ mod tests {
         extract_from_chunk(&chunk, &mut out);
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], Ev::Text(t) if t == "keep"));
+    }
+
+    #[test]
+    fn batchgraphql_proto3_shells_do_not_swallow_text() {
+        // Live shape (2026-08-30): every field present with an empty value.
+        // Text parts must survive; empty shells must not become drops/images.
+        let chunk = json!({
+            "candidates": [{ "content": { "role": "model", "parts": [
+                {
+                    "data": "text", "text": "PONG", "thought": false,
+                    "thoughtSignature": "",
+                    "inlineData": { "mimeType": "", "data": "" },
+                    "fileData": { "mimeType": "", "fileUri": "" },
+                    "functionCall": { "name": "", "args": "" }
+                },
+                {
+                    "data": "text", "text": "-COOKIE", "thought": false,
+                    "thoughtSignature": "",
+                    "inlineData": { "mimeType": "", "data": "" },
+                    "fileData": { "mimeType": "", "fileUri": "" },
+                    "functionCall": { "name": "", "args": "" },
+                    "executableCode": { "code": "", "language": "" },
+                    "codeExecutionResult": { "outcome": "", "content": "" }
+                }
+            ]}, "finishReason": "FINISH_REASON_UNSPECIFIED" }],
+            "promptFeedback": {}
+        });
+        let mut out = Vec::new();
+        extract_from_chunk(&chunk, &mut out);
+        assert_eq!(
+            out.len(),
+            2,
+            "exactly two text events, no drops/images: {out:?}"
+        );
+        assert!(matches!(&out[0], Ev::Text(t) if t == "PONG"));
+        assert!(matches!(&out[1], Ev::Text(t) if t == "-COOKIE"));
     }
 
     #[test]
