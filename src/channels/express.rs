@@ -61,6 +61,7 @@ impl ExpressClient {
         stream: bool,
     ) -> Result<EvStream, UpstreamError> {
         let url = self.url(model, stream);
+        log_outbound(payload);
         let mut req = self
             .http
             .post(&url)
@@ -88,6 +89,18 @@ impl ExpressClient {
         }
         Ok(EvStream::new(rx))
     }
+}
+
+/// DEBUG log of the outbound payload's rewritten knobs (contents excluded:
+/// they can carry large base64 images and user text).
+pub fn log_outbound(payload: &Value) {
+    tracing::debug!(
+        generation_config = %payload["generationConfig"],
+        safety_settings = ?payload["safetySettings"]
+            .as_array()
+            .map(|a| a.iter().map(|s| s["category"].as_str().unwrap_or("?")).collect::<Vec<_>>()),
+        "outbound payload (post-rewrite)"
+    );
 }
 
 /// Transport failures before/while the request runs are retryable (§12.1).

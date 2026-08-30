@@ -55,7 +55,10 @@ async fn log_request(req: Request, next: Next) -> Response {
 async fn main() {
     tracing_subscriber::fmt()
         .with_target(false)
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let cfg = config::load_config();

@@ -154,6 +154,7 @@ impl CookieClient {
     ) -> Result<EvStream, UpstreamError> {
         // batchGraphql has a single operation (StreamGenerateContent);
         // non-streaming is aggregated from the same event stream (§7.2).
+        crate::channels::express::log_outbound(payload);
         let body = self.build_shell(payload, model).to_string();
         let resp = self
             .http
