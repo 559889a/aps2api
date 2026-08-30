@@ -162,6 +162,31 @@ fn usage_output_tokens(usage: &Value) -> Option<u64> {
     }
 }
 
+/// (ascii, non-ascii) char counts of one text event — the raw material for
+/// est_tokens. Counted in the event loop, before prefill dedup, so it measures
+/// what the upstream actually generated (the same population real usage
+/// counts).
+fn ascii_split(text: &str) -> (u64, u64) {
+    let mut ascii = 0u64;
+    let mut other = 0u64;
+    for c in text.chars() {
+        if c.is_ascii() {
+            ascii += 1;
+        } else {
+            other += 1;
+        }
+    }
+    (ascii, other)
+}
+
+/// Ballpark output-token estimate for the stream summary when the upstream
+/// reports no usage (the cookie channel never does, §7.2): ~4 ASCII chars make
+/// a token, ~1 non-ASCII char (CJK and friends) makes one. The summary logs it
+/// as tokens_est/tps_est so it can never be mistaken for a real usage count.
+fn est_tokens(ascii: u64, other: u64) -> u64 {
+    ascii / 4 + other
+}
+
 /// Streaming execution: spawns the retry pump, returns the receiver the axum
 /// body streams from. Each element is a wire-ready byte segment.
 pub async fn run_stream(
@@ -203,6 +228,10 @@ pub async fn run_stream(
             // many output tokens the usage trailer reported.
             let mut first_token_at: Option<Instant> = None;
             let mut output_tokens: Option<u64> = None;
+            // Text volume forwarded this attempt, for est_tokens when usage
+            // is absent.
+            let mut ascii_chars: u64 = 0;
+            let mut other_chars: u64 = 0;
             // Each attempt rebuilds the request inside start(): cookie
             // regenerates requestContext + SAPISIDHASH; express rebuilds the
             // request object (body is time-independent, §12.3).
@@ -329,14 +358,39 @@ pub async fn run_stream(
                                         retries = attempt,
                                         "stream complete"
                                     ),
-                                    None => tracing::info!(
-                                        channel = channel_name(channel),
-                                        model = %model,
-                                        total_s = total_s,
-                                        gen_s = gen_s,
-                                        retries = attempt,
-                                        "stream complete"
-                                    ),
+                                    None => {
+                                        // No usable usage (the cookie channel
+                                        // never reports any): estimate from
+                                        // the text actually forwarded.
+                                        // est-marked fields — never a real
+                                        // count.
+                                        let est = est_tokens(ascii_chars, other_chars);
+                                        if est > 0 && gen_dur.as_secs_f64() > 0.0 {
+                                            tracing::info!(
+                                                channel = channel_name(channel),
+                                                model = %model,
+                                                total_s = total_s,
+                                                gen_s = gen_s,
+                                                tokens_est = est,
+                                                tps_est = (est as f64
+                                                    / gen_dur.as_secs_f64()
+                                                    * 10.0)
+                                                    .round()
+                                                    / 10.0,
+                                                retries = attempt,
+                                                "stream complete"
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                channel = channel_name(channel),
+                                                model = %model,
+                                                total_s = total_s,
+                                                gen_s = gen_s,
+                                                retries = attempt,
+                                                "stream complete"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             None => tracing::info!(
@@ -388,6 +442,11 @@ pub async fn run_stream(
                 emitted = true;
                 if let Ev::Usage(u) = &ev {
                     output_tokens = usage_output_tokens(u);
+                }
+                if let Ev::Text(t) | Ev::Thought(t) = &ev {
+                    let (a, o) = ascii_split(t);
+                    ascii_chars += a;
+                    other_chars += o;
                 }
                 for b in em.on_event(&ev) {
                     if tx.send(Ok(b)).await.is_err() {
@@ -793,5 +852,20 @@ mod tests {
         assert_eq!(secs_f64(Duration::from_millis(13_612)), 13.61);
         assert_eq!(secs_f64(Duration::from_millis(13_600)), 13.6);
         assert_eq!(secs_f64(Duration::ZERO), 0.0);
+    }
+
+    #[test]
+    fn est_tokens_ballpark_counts() {
+        // ~4 ASCII chars per token, ~1 per non-ASCII char — ballpark only.
+        assert_eq!(ascii_split("Hello, world!"), (13, 0));
+        assert_eq!(ascii_split("你好"), (0, 2));
+        assert_eq!(ascii_split("Hi 你好!"), (4, 2));
+        assert_eq!(ascii_split(""), (0, 0));
+        assert_eq!(est_tokens(0, 0), 0);
+        assert_eq!(est_tokens(8, 0), 2); // pure ASCII: len / 4
+        assert_eq!(est_tokens(0, 10), 10); // pure CJK: 1:1
+        assert_eq!(est_tokens(12, 6), 9); // mixed: 3 + 6
+                                          // ASCII remainder shorter than a token still yields the CJK count.
+        assert_eq!(est_tokens(3, 4), 4);
     }
 }
