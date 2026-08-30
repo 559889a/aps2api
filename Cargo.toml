@@ -22,6 +22,18 @@ reqwest = { version = "=0.13.4", default-features = false, features = [
     "stream",
     "socks",
 ] }
+# TLS for reqwest (express/image clients): an explicit preconfigured rustls
+# config with the bundled Mozilla roots. reqwest 0.13's plain `rustls` feature
+# installs rustls-platform-verifier when no roots are supplied, and that
+# verifier needs a JNI app context on Android — it panics in a bare Termux
+# process (2026-08-30 real-device smoke). rustls is a direct dep only to build
+# that config; both pins resolve to versions already in the dependency graph.
+rustls = { version = "=0.23.43", default-features = false, features = [
+    "std",
+    "tls12",
+    "aws_lc_rs",
+] }
+webpki-roots = "=1.0.9"
 wreq = { version = "=0.16.1", features = [
     "stream",
     "socks",

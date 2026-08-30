@@ -1,7 +1,10 @@
 //! Outbound HTTP clients (spec §4 httpx / §1.4 / §6.1).
 //!
 //! Invariants:
-//! - express channel uses plain `reqwest` (official endpoint, no masquerade);
+//! - express channel uses plain `reqwest` (official endpoint, no masquerade)
+//!   with an explicit preconfigured rustls TLS config (`express_tls`, bundled
+//!   Mozilla roots): reqwest 0.13's default rustls-platform-verifier needs a
+//!   JNI app context on Android and panics in a bare Termux process;
 //!   cookie channel uses `wreq` with the pinned Chrome TLS/HTTP2 emulation.
 //! - Both clients attach the SAME configured socks5 proxy (authenticated URLs
 //!   with embedded user:pass supported); with no `socks5` field both connect
@@ -9,6 +12,7 @@
 //!   outbound behavior is decided by config.yaml alone.
 //! - Connection timeout 30s; NO total timeout (streaming red line, §5.4).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::Config;
@@ -35,13 +39,40 @@ pub fn proxied_url(url: &str) -> String {
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Explicit rustls TLS config for both reqwest clients (express + remote
+/// image fetching, spec §6.1 note).
+///
+/// reqwest 0.13's `rustls` feature installs rustls-platform-verifier whenever
+/// no root certificates are supplied; on Android that verifier requires a JNI
+/// app context and PANICS in a bare Termux process ("Expect
+/// rustls-platform-verifier to be initialized" — 2026-08-30 real-device
+/// smoke, invisible to CI). Handing reqwest a preconfigured ClientConfig
+/// switches every platform to rustls' own WebPkiServerVerifier over the
+/// bundled Mozilla roots: no OS cert store, no JNI, identical verification
+/// on Windows / Linux / Termux.
+fn express_tls() -> Result<rustls::ClientConfig, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(rustls::ALL_VERSIONS)
+        .map_err(|e| format!("rustls protocol versions: {e}"))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    // Preconfigured configs bypass reqwest's ALPN wiring; mirror its default
+    // (h2 + http/1.1) here.
+    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(tls)
+}
+
 /// reqwest client for the express channel.
 pub fn build_express_client(cfg: &Config) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         // Never touch HTTP(S)_PROXY env vars: config.yaml is the single
         // source of truth for outbound routing (spec §1.4).
-        .no_proxy();
+        .no_proxy()
+        .tls_backend_preconfigured(Some(express_tls()?));
     if let Some(url) = &cfg.socks5 {
         let resolved = proxied_url(url);
         let p = reqwest::Proxy::all(&resolved)
@@ -79,7 +110,8 @@ pub fn build_image_client(cfg: &Config) -> Result<reqwest::Client, String> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
-        .no_proxy();
+        .no_proxy()
+        .tls_backend_preconfigured(Some(express_tls()?));
     if let Some(url) = &cfg.socks5 {
         let resolved = proxied_url(url);
         let p = reqwest::Proxy::all(&resolved)
