@@ -38,6 +38,10 @@ the response back in the client's protocol.
 - **Automatic retry** — on upstream 429/50x and transient stream errors, with
   fixed-interval or linear-backoff strategy, SSE keep-alive heartbeats while waiting,
   and a strict never-retry-after-emitting guarantee.
+- **Observable by design** — every retry is a `WARN` log line with its reason and
+  backoff, every successful response logs time-to-first-token plus the gateway's own
+  prep cost, and each finished stream gets a one-line summary with total time and
+  tokens/TPS (estimated on channels that don't report usage). See [Logging](#logging).
 - **Non-streaming over streaming-only upstreams** — the cookie channel has no
   non-streaming endpoint, so non-streaming requests are served by aggregating its SSE
   stream server-side; and an optional **bypass / fake-streaming mode** exposes
@@ -139,6 +143,35 @@ the Gemini-native endpoint (and `fake-streaming/express/` bypass aliases when
 
 Auth for every endpoint except `/health`: `Authorization: Bearer <api_key>` or
 `x-goog-api-key: <api_key>`.
+
+## Logging
+
+The server logs to stdout at `info` level by default (override with `RUST_LOG`, e.g.
+`RUST_LOG=aps2api=debug,info`). A request is fully visible in five log lines:
+
+| Log line | Level | Meaning |
+|----------|-------|---------|
+| `chat completion` / `gemini generate` | INFO | request accepted: `model`, `channel`, `stream`, `bypass` |
+| `upstream attempt failed; retrying` | WARN | a retry was scheduled: `retry`/`max` within the budget, `delay_secs` backoff, failure reason |
+| `upstream first response` | INFO | first token arrived: `ttfb_ms` (per attempt, reset on retry) and `prep_us` — the gateway's own pre-upstream cost (request received → dispatched), measured once on the first attempt |
+| `stream complete` | INFO | the stream ended normally: `total_s` wall clock, `gen_s` first-token→end window, `retries` consumed, and output size/speed — `tokens`/`tps` when the upstream reports usage (express), `tokens_est`/`tps_est` when it does not (cookie) |
+| `upstream failed (...); returning the error to the client` | ERROR | terminal failure and its class: non-retryable, content-already-emitted (never-retry guarantee), or retry budget exhausted |
+
+Notes:
+
+- `tokens_est`/`tps_est` are ballpark estimates (~4 ASCII chars or ~1 non-ASCII char
+  per token, thinking text included) for channels whose upstream never returns usage
+  metadata — the `_est` suffix marks them as estimates, and real usage always wins
+  when present. They are deliberately not comparable to a client-side tokenizer count.
+- Fake-streaming bypass requests log neither `upstream first response` nor
+  `stream complete`: their upstream is a single non-streaming call, so there is no
+  first token to time.
+- Non-streaming requests log `upstream first response` (the first aggregated event is
+  the first token) but no summary line.
+- The `prep_us` clock starts at handler entry. On the Gemini-native port that includes
+  reading and JSON-parsing the request body; on the OpenAI endpoint the axum `Json`
+  extractor parses before the handler runs, so that parse cost is not included —
+  don't compare `prep_us` across the two ports.
 
 ## Project Structure
 
