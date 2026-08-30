@@ -217,6 +217,7 @@ mod tests {
         Ir {
             model: model.into(),
             forced_channel: None,
+            bypass: false,
             stream: false,
             contents: vec![json!({"role": "user", "parts": [{"text": "hi"}]})],
             system: None,

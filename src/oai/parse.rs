@@ -6,7 +6,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::ir::{split_channel_prefix, ApiError, Ir};
+use crate::ir::{split_model_name, ApiError, Ir};
 
 pub fn parse(body: &Value) -> Result<Ir, ApiError> {
     let model = body
@@ -19,10 +19,11 @@ pub fn parse(body: &Value) -> Result<Ir, ApiError> {
         return Err(ApiError::bad_request("`model` is required"));
     }
 
-    let (name, forced) = split_channel_prefix(&model);
+    let (name, forced, bypass) = split_model_name(&model);
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut ir = Ir::new(name, stream);
     ir.forced_channel = forced;
+    ir.bypass = bypass;
 
     let messages = body
         .get("messages")

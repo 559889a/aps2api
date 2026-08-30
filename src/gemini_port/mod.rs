@@ -127,7 +127,7 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
 
 /// Strip any channel prefix, resolve aliases, and 404 on unknown models.
 fn resolve_and_info(state: &AppState, model: &str) -> Result<String, ApiError> {
-    let (bare, _forced) = crate::ir::split_channel_prefix(model);
+    let (bare, _forced, _bypass) = crate::ir::split_model_name(model);
     oai::resolve_model_name(&state.models.alias_map, &state.models.models, &bare)
 }
 
@@ -183,6 +183,11 @@ async fn handle_inner(
     body: &Value,
 ) -> Result<Response, ApiError> {
     let mut ir = parse::parse(model, stream, body)?;
+    // Bypass gate (§9.5): reject fake-streaming aliases when the switch is
+    // off or the alias does not target the express channel.
+    if let Some(msg) = ir.bypass_violation(state.config.bypass) {
+        return Err(ApiError::bad_request(msg));
+    }
     let channel = ir
         .resolve_channel(
             state.config.express_enabled(),
@@ -210,12 +215,19 @@ async fn handle_inner(
         model = %ir.model,
         channel = match channel { Channel::Express => "express", Channel::Cookie => "cookie" },
         stream = ir.stream,
+        bypass = ir.bypass,
         "gemini generate"
     );
 
     if stream {
         let em = Box::new(emit::GeminiEmitter::new(&ir.model, &ir.prefill, true));
-        let rx = pipeline::run_stream(&state.ctx, channel, &ir, payload, em).await;
+        // Bypass alias: stream to the client, non-stream to the upstream
+        // (spec §9.5). Everything else takes the normal streaming path.
+        let rx = if ir.bypass {
+            pipeline::run_bypass(&state.ctx, &ir, payload, em).await
+        } else {
+            pipeline::run_stream(&state.ctx, channel, &ir, payload, em).await
+        };
         Ok((
             StatusCode::OK,
             [

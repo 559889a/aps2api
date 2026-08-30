@@ -32,6 +32,12 @@ the response back in the client's protocol.
 - **Automatic retry** — on upstream 429/50x and transient stream errors, with
   fixed-interval or linear-backoff strategy, SSE keep-alive heartbeats while waiting,
   and a strict never-retry-after-emitting guarantee.
+- **Non-streaming over streaming-only upstreams** — the cookie channel has no
+  non-streaming endpoint, so non-streaming requests are served by aggregating its SSE
+  stream server-side; and an optional **bypass / fake-streaming mode** exposes
+  `fake-streaming/express/<model>` aliases: the client gets a real SSE stream with
+  keep-alive heartbeats during the silent wait, while the upstream runs as a single
+  non-streaming call whose complete answer is replayed in one burst.
 - **Local API key auth** and a global **authenticated SOCKS5 proxy** option
   (`socks5://user:pass@host:port`) that applies to every upstream connection.
 
@@ -97,6 +103,7 @@ All settings live in `config.yaml` next to the binary; see the heavily commented
 | `express.api_key` / `express.project_id` / `express.location` | Express channel credentials; keep `location: global` |
 | `cookie.cookie` / `cookie.project_id` / `cookie.experiment_flags` | cookie channel credentials |
 | `thinking_level` | forced thinking level: `minimal`/`low`/`medium`/`high`, empty = family defaults |
+| `bypass` | fake-streaming aliases: when `true`, `fake-streaming/express/<model>` ids are listed and served (SSE to the client, non-streaming to the express upstream, heartbeat-bridged); default `false` |
 | `retry.max` / `retry.strategy` / `retry.interval` | retry count (`max+1` attempts total), `fixed`/`backoff`, fixed interval seconds |
 
 Exposed models come from `model.json` (`models` list + optional `alias_map` for
@@ -113,7 +120,7 @@ resolution fails entirely and proxy-side resolution works.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | liveness probe, no auth |
-| GET | `/v1/models` | OpenAI-style model list (from `model.json`) |
+| GET | `/v1/models` | OpenAI-style model list (`model.json` plus `express/`- and `cookie/`-prefixed forms, and `fake-streaming/express/` aliases when `bypass: true`) |
 | POST | `/v1/chat/completions` | OpenAI chat completions, `stream: true/false` |
 | GET | `/v1beta/models` | Gemini-style model list |
 | GET | `/v1beta/models/{model}` | single model info |

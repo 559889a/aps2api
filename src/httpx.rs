@@ -103,6 +103,7 @@ mod tests {
             express: Default::default(),
             cookie: Default::default(),
             thinking_level: String::new(),
+            bypass: false,
             retry: Default::default(),
         }
     }

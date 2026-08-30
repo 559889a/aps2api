@@ -4,12 +4,13 @@
 
 use serde_json::{Map, Value};
 
-use crate::ir::{split_channel_prefix, ApiError, Ir};
+use crate::ir::{split_model_name, ApiError, Ir};
 
 pub fn parse(model_in_path: &str, stream: bool, body: &Value) -> Result<Ir, ApiError> {
-    let (name, forced) = split_channel_prefix(model_in_path);
+    let (name, forced, bypass) = split_model_name(model_in_path);
     let mut ir = Ir::new(name, stream);
     ir.forced_channel = forced;
+    ir.bypass = bypass;
 
     // ---- contents ----
     let contents = body

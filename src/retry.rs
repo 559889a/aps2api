@@ -13,8 +13,14 @@ use crate::config::RetryConfig;
 /// count; reaching the first event lifts the deadline for good.
 pub const FIRST_RESPONSE_BUDGET: Duration = Duration::from_secs(30);
 
-const HEARTBEAT_EVERY: Duration = Duration::from_secs(3);
-const HEARTBEAT: &[u8] = b": keep-alive\n\n";
+/// Bypass (fake-streaming) first-response budget (§9.5): the upstream runs
+/// NON-streaming, so its single JSON arrives only at completion — a legit
+/// generation can far exceed the 30s streaming budget. 300s bounds a hung
+/// upstream while heartbeats keep the SSE client alive.
+pub const BYPASS_FIRST_RESPONSE_BUDGET: Duration = Duration::from_secs(300);
+
+pub(crate) const HEARTBEAT_EVERY: Duration = Duration::from_secs(3);
+pub(crate) const HEARTBEAT: &[u8] = b": keep-alive\n\n";
 
 /// Seconds to wait before retry attempt `n` (1-based): `fixed` waits
 /// `interval` every time; `backoff` waits n seconds (linear, no cap).

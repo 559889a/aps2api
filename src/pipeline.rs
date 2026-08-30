@@ -291,3 +291,157 @@ pub async fn run_nonstream(
         }
     }
 }
+
+/// Bypass (fake-streaming) execution (spec §9.5): the client streams over the
+/// `fake-streaming/express/<model>` alias while the upstream request runs
+/// NON-streaming (express `:generateContent`). During every silent stretch
+/// the pump emits `: keep-alive` heartbeats — that keeps first-byte-timeout
+/// clients alive and doubles as disconnect detection (a failed heartbeat
+/// write tears everything down within one cadence step). When the complete
+/// upstream response has arrived, the aggregated events are flushed through
+/// the normal streaming emitter in one burst (role chunk → content →
+/// finish → [DONE]). Heartbeats never count as emitted content (§12.3), so
+/// retryable upstream failures keep their full retry budget.
+pub async fn run_bypass(
+    ctx: &Ctx,
+    ir: &crate::ir::Ir,
+    payload: Value,
+    mut em: Box<dyn PortEmitter>,
+) -> mpsc::Receiver<Result<Bytes, std::convert::Infallible>> {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::convert::Infallible>>(64);
+    let cfg = ctx.config.clone();
+    // Bypass is hard-wired to the express channel (§9.5); the dispatch gate
+    // has already rejected every other routing.
+    let client_owned = ctx.client(Channel::Express).cloned();
+    let model = ir.model.clone();
+    tokio::spawn(async move {
+        let client = match client_owned {
+            Ok(c) => c,
+            Err(e) => {
+                for b in em.on_error(&UpstreamError {
+                    kind: ErrorKind::Invalid,
+                    status: Some(400),
+                    message: e.message,
+                }) {
+                    if tx.send(Ok(b)).await.is_err() {
+                        return;
+                    }
+                }
+                return;
+            }
+        };
+        let mut attempt: u32 = 0;
+        'outer: loop {
+            // Non-streaming upstream: stream=false regardless of the client's
+            // SSE request (that is the whole point of bypass).
+            let mut stream = match client.start(&payload, &model, false).await {
+                Ok(s) => s,
+                Err(e) => {
+                    if e.retryable() && attempt < cfg.retry.max {
+                        attempt += 1;
+                        if !retry::wait_with_heartbeat(
+                            retry::retry_delay(&cfg.retry, attempt),
+                            true,
+                            &tx,
+                        )
+                        .await
+                        {
+                            return; // client gone
+                        }
+                        continue 'outer;
+                    }
+                    for b in em.on_error(&e) {
+                        if tx.send(Ok(b)).await.is_err() {
+                            return;
+                        }
+                    }
+                    return;
+                }
+            };
+
+            // Collect the complete upstream response, heartbeating through
+            // every silent stretch. The budget bounds only the wait for the
+            // FIRST event (a non-stream upstream emits everything at once at
+            // the end); afterwards the heartbeat cadence runs unbounded.
+            let mut events: Vec<Ev> = Vec::new();
+            let mut waited = std::time::Duration::ZERO;
+            let outcome = loop {
+                match tokio::time::timeout(retry::HEARTBEAT_EVERY, stream.next()).await {
+                    Ok(Some(Ev::Error(e))) => break Err(e),
+                    Ok(Some(ev)) => {
+                        events.push(ev);
+                        waited = std::time::Duration::ZERO;
+                    }
+                    Ok(None) => break Ok(()),
+                    Err(_elapsed) => {
+                        waited += retry::HEARTBEAT_EVERY;
+                        if events.is_empty() && waited >= retry::BYPASS_FIRST_RESPONSE_BUDGET {
+                            break Err(UpstreamError {
+                                kind: ErrorKind::Transport,
+                                status: None,
+                                message: format!(
+                                    "upstream did not produce any content within the bypass \
+                                     first-response budget ({}s)",
+                                    retry::BYPASS_FIRST_RESPONSE_BUDGET.as_secs()
+                                ),
+                            });
+                        }
+                        // Keep-alive + disconnect detection (3s granularity).
+                        if tx
+                            .send(Ok(Bytes::from_static(retry::HEARTBEAT)))
+                            .await
+                            .is_err()
+                        {
+                            return; // client gone: drop upstream + pump
+                        }
+                    }
+                }
+            };
+
+            let e = match outcome {
+                Ok(()) => match events.iter().find_map(|ev| match ev {
+                    Ev::Error(e) => Some(e.clone()),
+                    _ => None,
+                }) {
+                    Some(e) => e,
+                    None => {
+                        // Success: one-shot flush of the whole answer.
+                        for ev in &events {
+                            for b in em.on_event(ev) {
+                                if tx.send(Ok(b)).await.is_err() {
+                                    return; // client disconnected mid-flush
+                                }
+                            }
+                        }
+                        for b in em.on_stream_end() {
+                            if tx.send(Ok(b)).await.is_err() {
+                                return;
+                            }
+                        }
+                        return;
+                    }
+                },
+                Err(e) => e,
+            };
+
+            // Failure path: nothing semantic has been written yet, so the
+            // §12.3 red line still allows retrying.
+            if e.retryable() && attempt < cfg.retry.max {
+                attempt += 1;
+                if !retry::wait_with_heartbeat(retry::retry_delay(&cfg.retry, attempt), true, &tx)
+                    .await
+                {
+                    return;
+                }
+                continue 'outer;
+            }
+            for b in em.on_error(&e) {
+                if tx.send(Ok(b)).await.is_err() {
+                    return;
+                }
+            }
+            return;
+        }
+    });
+    rx
+}

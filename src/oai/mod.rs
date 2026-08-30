@@ -36,7 +36,8 @@ impl PortEmitter for emit::OaiEmitter {
 }
 
 /// GET /v1/models — model.json list; `express/` and `cookie/` prefixed forms
-/// are additionally listed (spec §9.1).
+/// are additionally listed, plus the `fake-streaming/express/` bypass aliases
+/// when bypass is enabled (spec §9.1/§9.5).
 pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     let mut data = Vec::new();
     for m in &state.models.models {
@@ -45,6 +46,11 @@ pub async fn list_models(State(state): State<AppState>) -> impl IntoResponse {
     for m in &state.models.models {
         data.push(model_entry(&format!("express/{m}")));
         data.push(model_entry(&format!("cookie/{m}")));
+    }
+    if state.config.bypass {
+        for m in &state.models.models {
+            data.push(model_entry(&format!("fake-streaming/express/{m}")));
+        }
     }
     Json(json!({ "object": "list", "data": data }))
 }
@@ -94,6 +100,11 @@ fn upstream_error_response(e: &crate::ir::UpstreamError) -> Response {
 
 async fn handle_chat(state: &AppState, body: &Value) -> Result<Response, ApiError> {
     let mut ir = parse::parse(body)?;
+    // Bypass gate (§9.5): reject fake-streaming aliases when the switch is
+    // off or the alias does not target the express channel.
+    if let Some(msg) = ir.bypass_violation(state.config.bypass) {
+        return Err(ApiError::bad_request(msg));
+    }
     let channel = ir
         .resolve_channel(
             state.config.express_enabled(),
@@ -126,6 +137,7 @@ async fn handle_chat(state: &AppState, body: &Value) -> Result<Response, ApiErro
         model = %ir.model,
         channel = match channel { Channel::Express => "express", Channel::Cookie => "cookie" },
         stream = ir.stream,
+        bypass = ir.bypass,
         "chat completion"
     );
 
@@ -136,7 +148,13 @@ async fn handle_chat(state: &AppState, body: &Value) -> Result<Response, ApiErro
             &ir.prefill,
             true,
         ));
-        let rx = pipeline::run_stream(&state.ctx, channel, &ir, payload, em).await;
+        // Bypass alias: stream to the client, non-stream to the upstream
+        // (spec §9.5). Everything else takes the normal streaming path.
+        let rx = if ir.bypass {
+            pipeline::run_bypass(&state.ctx, &ir, payload, em).await
+        } else {
+            pipeline::run_stream(&state.ctx, channel, &ir, payload, em).await
+        };
         Ok((
             StatusCode::OK,
             [

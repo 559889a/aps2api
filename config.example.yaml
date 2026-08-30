@@ -36,6 +36,16 @@ cookie:
 # generationConfig.thinkingConfig is passed through.
 thinking_level: ""
 
+# ============ Bypass mode (fake streaming, express channel only) ============
+# When true, a `fake-streaming/express/<model>` alias is offered for every
+# model (e.g. fake-streaming/express/gemini-3.7-flash). A STREAMING request on
+# such an alias runs the upstream as a NON-streaming express call and plays the
+# complete answer back as one SSE burst, with `: keep-alive` heartbeats every
+# 3s during the silent wait so clients with a first-byte timeout do not melt
+# the connection. When false the aliases are absent from /v1/models and any
+# request carrying one is rejected.
+bypass: false
+
 # ============ Retry ============
 retry:
   max: 3                            # retries after failure; total attempts = max + 1

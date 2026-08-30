@@ -28,6 +28,11 @@ pub struct Config {
     /// Forced thinking level: minimal | low | medium | high, empty = not forced.
     #[serde(default)]
     pub thinking_level: String,
+    /// Bypass (fake streaming) switch: when true, the
+    /// `fake-streaming/express/<model>` aliases are listed and served
+    /// (spec §9.5). Default false.
+    #[serde(default)]
+    pub bypass: bool,
     #[serde(default)]
     pub retry: RetryConfig,
 }
