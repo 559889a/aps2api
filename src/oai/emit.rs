@@ -76,7 +76,8 @@ impl OaiEmitter {
         if finish_reason.is_some() {
             choices["delta"] = json!({});
         }
-        Bytes::from(
+        Bytes::from(format!(
+            "data: {}\n\n",
             json!({
                 "id": self.id,
                 "object": "chat.completion.chunk",
@@ -84,9 +85,7 @@ impl OaiEmitter {
                 "model": self.model,
                 "choices": [choices],
             })
-            .to_string()
-                + "\n\n",
-        )
+        ))
     }
 
     fn data_prefix(v: Value) -> Bytes {
@@ -242,9 +241,17 @@ impl OaiEmitter {
     }
 
     /// Non-streaming: final chat.completion JSON (spec §9.4) with prefill
-    /// stitched back via strip_overlap and a §13.4 diagnostic when empty.
+    /// stitched back (final = prefill + deduped continuation, spec §11.3) and
+    /// a §13.4 diagnostic when empty.
     pub fn take_result(&mut self) -> Value {
-        let mut content = strip_overlap(&self.prefill, &self.content);
+        // Prefill always leads the body; the continuation has the prefill's
+        // overlap removed. When the model restated the whole prefill,
+        // strip_overlap cuts it back to just the remainder.
+        let mut content = format!(
+            "{}{}",
+            self.prefill,
+            strip_overlap(&self.prefill, &self.content)
+        );
         if content.is_empty() && self.reasoning.is_empty() {
             content = self.empty_diagnosis();
         } else if content.is_empty() && !self.reasoning.is_empty() {
@@ -292,6 +299,7 @@ mod tests {
         let out = em.on_event(&Ev::Text("hello".into()));
         assert_eq!(out.len(), 2); // role chunk + content chunk
         let s = String::from_utf8_lossy(&out[0]);
+        assert!(s.starts_with("data: "));
         assert!(s.contains(r#""role":"assistant""#));
         assert!(s.contains(r#""model":"gemini-3.1-pro""#));
         let s2 = String::from_utf8_lossy(&out[1]);
@@ -351,6 +359,29 @@ mod tests {
         assert_eq!(v["choices"][0]["message"]["reasoning_content"], "thinking");
         assert_eq!(v["choices"][0]["finish_reason"], "length");
         assert_eq!(v["usage"]["total_tokens"], 3);
+    }
+
+    #[test]
+    fn nonstream_prefill_is_stitched_before_continuation() {
+        let mut em = OaiEmitter::new("m", false, "The capital of France is", false);
+        em.on_event(&Ev::Text(" Paris.".into()));
+        let v = em.take_result();
+        assert_eq!(
+            v["choices"][0]["message"]["content"],
+            "The capital of France is Paris."
+        );
+    }
+
+    #[test]
+    fn nonstream_full_restatement_keeps_single_prefill() {
+        let mut em = OaiEmitter::new("m", false, "The capital of France is", false);
+        // Model restated the whole prefill plus its continuation.
+        em.on_event(&Ev::Text("The capital of France is Paris.".into()));
+        let v = em.take_result();
+        assert_eq!(
+            v["choices"][0]["message"]["content"],
+            "The capital of France is Paris."
+        );
     }
 
     #[test]
