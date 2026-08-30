@@ -27,24 +27,44 @@ pub fn parse(model_in_path: &str, stream: bool, body: &Value) -> Result<Ir, ApiE
         let mut parts = Vec::new();
         if let Some(arr) = turn.get("parts").and_then(Value::as_array) {
             for part in arr {
-                if part.get("functionCall").is_some()
-                    || part.get("functionResponse").is_some()
-                    || part.get("executableCode").is_some()
-                    || part.get("codeExecutionResult").is_some()
+                // Normalize keys FIRST, then filter: a snake_case
+                // `function_call`/`file_data` must be caught by the drop
+                // rules too (spec §10.2).
+                let mut p = normalize_keys(part.clone());
+                let Some(m) = p.as_object_mut() else {
+                    continue;
+                };
+                if m.contains_key("functionCall")
+                    || m.contains_key("functionResponse")
+                    || m.contains_key("executableCode")
+                    || m.contains_key("codeExecutionResult")
                 {
                     tracing::debug!("dropped tool/code part (not supported)");
                     continue;
                 }
-                // `thought`/`thoughtSignature` keys have no semantics without
-                // tool round-trips — stripped (spec §10.2).
-                let mut p = normalize_keys(part.clone());
-                if let Value::Object(m) = &mut p {
-                    m.remove("thought");
-                    m.remove("thoughtSignature");
-                    // An empty part (no keys beyond those) is skipped.
-                    if m.is_empty() {
+                if m.contains_key("fileData") {
+                    tracing::warn!(
+                        "dropped fileData part: audio/video/file input is not supported"
+                    );
+                    continue;
+                }
+                if let Some(inline) = m.get("inlineData") {
+                    let mime = inline.get("mimeType").and_then(Value::as_str).unwrap_or("");
+                    if !mime.starts_with("image/") {
+                        tracing::warn!(
+                            mime,
+                            "dropped non-image inlineData part (only image/* input is supported)"
+                        );
                         continue;
                     }
+                }
+                // `thought`/`thoughtSignature` keys have no semantics without
+                // tool round-trips — stripped (spec §10.2).
+                m.remove("thought");
+                m.remove("thoughtSignature");
+                // An empty part (no keys beyond those) is skipped.
+                if m.is_empty() {
+                    continue;
                 }
                 parts.push(p);
             }
@@ -71,11 +91,8 @@ pub fn parse(model_in_path: &str, stream: bool, body: &Value) -> Result<Ir, ApiE
     let gc = body
         .get("generationConfig")
         .or_else(|| body.get("generation_config"));
-    if let Some(g) = gc {
-        let n = normalize_keys(g.clone());
-        if let Value::Object(map) = n {
-            ir.generation_config = Value::Object(keep_whitelisted_gc(map));
-        }
+    if let Some(Value::Object(map)) = gc {
+        ir.generation_config = Value::Object(normalize_generation_config(map));
     }
 
     Ok(ir)
@@ -88,8 +105,15 @@ fn json_turn(role: &str, parts: Vec<Value>) -> Value {
     Value::Object(m)
 }
 
-fn keep_whitelisted_gc(map: Map<String, Value>) -> Map<String, Value> {
-    let whitelist = [
+/// Normalize + whitelist the generationConfig (spec §10.2): TOP-LEVEL keys
+/// are snake→camel normalized (`generation_config`/`top_p` style spellings),
+/// and `thinkingConfig` gets its inner keys normalized too. Every other
+/// VALUE is kept verbatim — responseSchema property names are a data
+/// contract, not protocol field names, and recursive camel-casing would
+/// rewrite that contract (2026-08-30 fix). topK and anything outside the
+/// whitelist is dropped here (§8.1/§8.2).
+fn normalize_generation_config(map: &Map<String, Value>) -> Map<String, Value> {
+    const WHITELIST: [&str; 10] = [
         "temperature",
         "topP",
         "stopSequences",
@@ -103,11 +127,20 @@ fn keep_whitelisted_gc(map: Map<String, Value>) -> Map<String, Value> {
     ];
     let mut out = Map::new();
     for (k, v) in map {
-        // topK is unconditionally dropped (spec §8.1); anything outside the
-        // whitelist is dropped too.
-        if whitelist.contains(&k.as_str()) && !v.is_null() {
-            out.insert(k, v);
+        let camel = if k.contains('_') {
+            to_camel(k)
+        } else {
+            k.clone()
+        };
+        if v.is_null() || !WHITELIST.contains(&camel.as_str()) {
+            continue;
         }
+        let v = if camel == "thinkingConfig" {
+            normalize_keys(v.clone())
+        } else {
+            v.clone()
+        };
+        out.insert(camel, v);
     }
     out
 }
@@ -219,5 +252,59 @@ mod tests {
         let ir = parse("cookie/gemini-3.6-flash", true, &body).unwrap();
         assert_eq!(ir.model, "gemini-3.6-flash");
         assert_eq!(ir.forced_channel, Some(crate::ir::Channel::Cookie));
+    }
+
+    #[test]
+    fn response_schema_property_names_are_preserved() {
+        // Regression: recursive camel-casing used to rewrite JSON Schema
+        // property names (`user_name` -> `userName`), silently changing the
+        // response contract the model is asked to produce.
+        let body = json!({
+            "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+            "generation_config": {
+                "response_mime_type": "application/json",
+                "response_schema": {
+                    "type": "object",
+                    "properties": { "user_name": { "type": "string" } }
+                },
+                "thinking_config": { "thinking_level": "LOW", "include_thoughts": true }
+            }
+        });
+        let ir = parse("gemini-3.1-pro", false, &body).unwrap();
+        let gc = ir.generation_config.as_object().unwrap();
+        assert_eq!(gc["responseMimeType"], "application/json");
+        assert_eq!(
+            gc["responseSchema"]["properties"]["user_name"]["type"],
+            "string"
+        );
+        // thinkingConfig inner keys still normalized.
+        assert_eq!(gc["thinkingConfig"]["thinkingLevel"], "LOW");
+        assert_eq!(gc["thinkingConfig"]["includeThoughts"], true);
+    }
+
+    #[test]
+    fn file_data_and_non_image_inline_parts_are_dropped() {
+        // §1.2/§10.2: fileData and non-image inlineData parts are dropped
+        // with a warning; snake_case spellings of tool/file parts must be
+        // caught too (normalize-before-filter).
+        let body = json!({
+            "contents": [{ "role": "user", "parts": [
+                { "text": "hi" },
+                { "fileData": { "fileUri": "gs://bucket/x", "mimeType": "video/mp4" } },
+                { "file_data": { "file_uri": "gs://bucket/y", "mime_type": "audio/wav" } },
+                { "inline_data": { "mime_type": "audio/wav", "data": "AA" } },
+                { "inlineData": { "mimeType": "image/png", "data": "BB" } },
+                { "function_call": { "name": "f", "args": {} } }
+            ]}]
+        });
+        let ir = parse("m", false, &body).unwrap();
+        let parts = ir.contents[0]["parts"].as_array().unwrap();
+        // text + the one image inlineData survive; fileData (both key
+        // spellings), non-image inlineData, and the snake_case function
+        // call are all dropped.
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "hi");
+        assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+        assert_eq!(parts[1]["inlineData"]["data"], "BB");
     }
 }

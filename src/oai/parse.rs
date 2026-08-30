@@ -179,12 +179,14 @@ fn convert_content(content: Option<&Value>) -> Vec<Value> {
 }
 
 /// data URL -> inlineData part; base64 payload is passed through verbatim
-/// (spec trap 14). Remote http(s) URLs become a `remoteFetch` placeholder
-/// that the handler resolves via the SSRF-guarded fetcher (§9.3).
+/// (spec trap 14). Non-image data URLs are rejected (spec §1.2: only
+/// image/* inline input is supported). Remote http(s) URLs become a
+/// `remoteFetch` placeholder that the handler resolves via the SSRF-guarded
+/// fetcher (§9.3).
 fn image_part(url: &str) -> Option<Value> {
     if let Some(rest) = url.strip_prefix("data:") {
         let (mime, data) = rest.split_once(";base64,")?;
-        if mime.is_empty() || data.is_empty() {
+        if mime.is_empty() || data.is_empty() || !mime.starts_with("image/") {
             return None;
         }
         return Some(serde_json::json!({
@@ -304,6 +306,25 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
         assert_eq!(parts[1]["inlineData"]["data"], b64);
+    }
+
+    #[test]
+    fn non_image_data_url_is_rejected() {
+        // §1.2: only image/* inline input is supported.
+        let body = json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "hi" },
+                    { "type": "image_url", "image_url": { "url": "data:audio/wav;base64,AA" } }
+                ]
+            }]
+        });
+        let ir = parse(&body).unwrap();
+        let parts = ir.contents[0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["text"], "hi");
     }
 
     #[test]
