@@ -400,9 +400,9 @@ mod tests {
         let output = format!("{}c", "a".repeat(50_000));
         assert_eq!(strip_overlap(&prefill, &output), "c");
 
-        // Overlap bounded by the shorter side, still >= 8 cut rule.
-        assert_eq!(strip_overlap("xxxxxxxxab", "xxxxxxxxy"), "y");
-        assert_eq!(strip_overlap("xxxxxxxab", "xxxxxxxxy"), "xxxxxxxxy");
+        // Overlap must be a prefill SUFFIX: 8 trailing x's cut, 7 kept.
+        assert_eq!(strip_overlap("abxxxxxxxx", "xxxxxxxxy"), "y");
+        assert_eq!(strip_overlap("abxxxxxxx", "xxxxxxxy"), "xxxxxxxy");
     }
 
     #[test]
