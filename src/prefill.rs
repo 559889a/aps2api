@@ -160,14 +160,55 @@ pub fn strip_overlap(prefill: &str, output: &str) -> String {
     }
     let pc: Vec<char> = prefill.chars().collect();
     let oc: Vec<char> = output.chars().collect();
-    let max_k = pc.len().min(oc.len());
-    for k in (8..=max_k).rev() {
-        if pc[pc.len() - k..] == oc[..k] {
-            let byte_skip: usize = oc[..k].iter().map(|c| c.len_utf8()).sum();
-            return output[byte_skip..].to_string();
-        }
+    // Longest suffix of `prefill` equal to a prefix of `output` in
+    // O(len(prefill)+len(output)) via the KMP failure function. The previous
+    // descending-length rescan was O(n^2) on adversarial input — a prefill
+    // ending in a long single-char run against an output opening with the
+    // same run — and the prefill is client-controlled, so that was a
+    // CPU-burn vector on the request path. Identical results, linear cost.
+    let k = longest_suffix_prefix(&pc, &oc);
+    if k >= 8 {
+        let byte_skip: usize = oc[..k].iter().map(|c| c.len_utf8()).sum();
+        return output[byte_skip..].to_string();
     }
     output.to_string()
+}
+
+/// Longest k with `a[a.len()-k..] == b[..k]` (0 when there is none or
+/// either side is empty).
+fn longest_suffix_prefix(a: &[char], b: &[char]) -> usize {
+    let m = b.len();
+    if m == 0 || a.is_empty() {
+        return 0;
+    }
+    // Failure function of pattern `b`.
+    let mut fail = vec![0usize; m];
+    let mut k = 0usize;
+    for i in 1..m {
+        while k > 0 && b[i] != b[k] {
+            k = fail[k - 1];
+        }
+        if b[i] == b[k] {
+            k += 1;
+        }
+        fail[i] = k;
+    }
+    // Stream `a` through the automaton: when it ends, `matched` is the
+    // length of the longest prefix of `b` that is a suffix of `a`.
+    let mut matched = 0usize;
+    for &c in a {
+        loop {
+            if matched < m && c == b[matched] {
+                matched += 1;
+                break;
+            }
+            if matched == 0 {
+                break;
+            }
+            matched = fail[matched - 1];
+        }
+    }
+    matched
 }
 
 /// Streaming deduper (spec §11.3, port of the Go `PrefillDeduper`).
@@ -341,6 +382,27 @@ mod tests {
         // no overlap
         assert_eq!(strip_overlap("abc", "xyz"), "xyz");
         assert_eq!(strip_overlap("", "xyz"), "xyz");
+    }
+
+    #[test]
+    fn strip_overlap_adversarial_runs() {
+        // Prefill ending in a long single-char run vs an output opening with
+        // the same run: every prefill suffix contains the trailing 'b', so
+        // the overlap is 0 — the answer must come out of the linear matcher
+        // (this shape was the O(n^2) rescan worst case).
+        let prefill = format!("{}b", "a".repeat(50_000));
+        let output = "a".repeat(50_000);
+        assert_eq!(strip_overlap(&prefill, &output), output);
+
+        // Positive shape: prefill = "b" + run, output = run + "c" — the
+        // whole run is the overlap and gets cut.
+        let prefill = format!("b{}", "a".repeat(50_000));
+        let output = format!("{}c", "a".repeat(50_000));
+        assert_eq!(strip_overlap(&prefill, &output), "c");
+
+        // Overlap bounded by the shorter side, still >= 8 cut rule.
+        assert_eq!(strip_overlap("xxxxxxxxab", "xxxxxxxxy"), "y");
+        assert_eq!(strip_overlap("xxxxxxxab", "xxxxxxxxy"), "xxxxxxxxy");
     }
 
     #[test]
