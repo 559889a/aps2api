@@ -32,21 +32,26 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - name: x86_64-pc-windows-msvc
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
-          - name: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            archive: tar
-          - name: aarch64-linux-android (termux)
-            os: ubuntu-latest
-            target: aarch64-linux-android
-            archive: tar
-            android: true
+    matrix:
+      include:
+        # label = user-facing platform name in release assets (AGENTS.md §5);
+        # target triples stay internal to build/packaging paths only.
+        - name: x86_64-pc-windows-msvc
+          os: windows-latest
+          target: x86_64-pc-windows-msvc
+          label: windows-x64
+          archive: zip
+        - name: x86_64-unknown-linux-gnu
+          os: ubuntu-latest
+          target: x86_64-unknown-linux-gnu
+          label: linux-x64
+          archive: tar
+        - name: aarch64-linux-android (termux)
+          os: ubuntu-latest
+          target: aarch64-linux-android
+          label: android-arm64
+          archive: tar
+          android: true
     steps:
       - uses: actions/checkout@v4
 
@@ -105,7 +110,7 @@ jobs:
         shell: pwsh
         run: |
           $ver = "${env:GITHUB_REF_NAME}"
-          $stage = "aps2api-$ver-${{ matrix.target }}"
+          $stage = "aps2api-$ver-${{ matrix.label }}"
           New-Item -ItemType Directory -Force "$stage" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/aps2api.exe" "$stage/"
           Copy-Item "config.example.yaml" "$stage/"
@@ -119,7 +124,7 @@ jobs:
         if: matrix.archive == 'tar'
         run: |
           VERSION="${GITHUB_REF_NAME}"
-          STAGE="aps2api-${VERSION}-${{ matrix.target }}"
+          STAGE="aps2api-${VERSION}-${{ matrix.label }}"
           mkdir -p "$STAGE"
           if [ "${{ matrix.android }}" = "true" ]; then
             BIN="target/aarch64-linux-android/release/aps2api"
@@ -137,10 +142,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            aps2api-*-${{ matrix.target }}.zip
-            aps2api-*-${{ matrix.target }}.zip.sha256
-            aps2api-*-${{ matrix.target }}.tar.gz
-            aps2api-*-${{ matrix.target }}.tar.gz.sha256
+            aps2api-*-${{ matrix.label }}.zip
+            aps2api-*-${{ matrix.label }}.zip.sha256
+            aps2api-*-${{ matrix.label }}.tar.gz
+            aps2api-*-${{ matrix.label }}.tar.gz.sha256
           generate_release_notes: true
 
   release:
