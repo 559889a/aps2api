@@ -5,6 +5,8 @@
 pub mod emit;
 pub mod parse;
 
+use std::time::Instant;
+
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
@@ -65,6 +67,10 @@ fn upstream_error_response(e: &crate::ir::UpstreamError) -> Response {
 
 /// Unified dispatcher for everything under /v1beta/.
 pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
+    // Gateway-own cost baseline: starts before the body is read, so prep_us
+    // on this port includes the JSON body parse (the OAI port's extractor
+    // parses before the handler runs and misses it).
+    let received_at = Instant::now();
     let path = req.uri().path().to_string();
     let Some(rest) = path.strip_prefix("/v1beta/") else {
         return gemini_error(ApiError {
@@ -116,8 +122,8 @@ pub async fn dispatch(State(state): State<AppState>, req: Request) -> Response {
     };
 
     match op {
-        "generateContent" => handle(state, model.to_string(), false, body).await,
-        "streamGenerateContent" => handle(state, model.to_string(), true, body).await,
+        "generateContent" => handle(state, model.to_string(), false, body, received_at).await,
+        "streamGenerateContent" => handle(state, model.to_string(), true, body, received_at).await,
         other => gemini_error(ApiError {
             status: 404,
             message: format!("unsupported operation {other:?}"),
@@ -171,8 +177,14 @@ fn single_model(name: &str) -> Response {
     .into_response()
 }
 
-async fn handle(state: AppState, model: String, stream: bool, body: Value) -> Response {
-    match handle_inner(&state, &model, stream, &body).await {
+async fn handle(
+    state: AppState,
+    model: String,
+    stream: bool,
+    body: Value,
+    received_at: Instant,
+) -> Response {
+    match handle_inner(&state, &model, stream, &body, received_at).await {
         Ok(resp) => resp,
         Err(e) => gemini_error(e),
     }
@@ -183,6 +195,7 @@ async fn handle_inner(
     model: &str,
     stream: bool,
     body: &Value,
+    received_at: Instant,
 ) -> Result<Response, ApiError> {
     let mut ir = parse::parse(model, stream, body)?;
     // Bypass gate (§9.5): reject fake-streaming aliases when the switch is
@@ -233,7 +246,7 @@ async fn handle_inner(
         let rx = if ir.bypass {
             pipeline::run_bypass(&state.ctx, &ir, payload, em).await
         } else {
-            pipeline::run_stream(&state.ctx, channel, &ir, payload, em).await
+            pipeline::run_stream(&state.ctx, channel, &ir, payload, received_at, em).await
         };
         Ok((
             StatusCode::OK,
@@ -246,7 +259,9 @@ async fn handle_inner(
             .into_response())
     } else {
         let em = emit::GeminiEmitter::new(&ir.model, &ir.prefill, false);
-        match pipeline::run_nonstream(&state.ctx, channel, &ir, payload, Box::new(em)).await {
+        match pipeline::run_nonstream(&state.ctx, channel, &ir, payload, received_at, Box::new(em))
+            .await
+        {
             Ok(v) => Ok((StatusCode::OK, Json(v)).into_response()),
             Err(e) => Ok(upstream_error_response(&e)),
         }

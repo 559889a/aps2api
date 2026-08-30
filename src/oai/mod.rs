@@ -4,6 +4,7 @@ pub mod emit;
 pub mod parse;
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::State;
@@ -60,7 +61,11 @@ fn model_entry(id: &str) -> Value {
 }
 
 pub async fn chat_completions(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
-    match handle_chat(&state, &body).await {
+    // Gateway-own cost baseline. The Json extractor has already parsed the
+    // body before this line, so prep_us on the OAI port misses that parse
+    // (the Gemini port reads the body itself and does include it).
+    let received_at = Instant::now();
+    match handle_chat(&state, &body, received_at).await {
         Ok(resp) => resp,
         Err(e) => oai_error(e),
     }
@@ -98,7 +103,11 @@ fn upstream_error_response(e: &crate::ir::UpstreamError) -> Response {
         .into_response()
 }
 
-async fn handle_chat(state: &AppState, body: &Value) -> Result<Response, ApiError> {
+async fn handle_chat(
+    state: &AppState,
+    body: &Value,
+    received_at: Instant,
+) -> Result<Response, ApiError> {
     let mut ir = parse::parse(body)?;
     // Bypass gate (§9.5): reject fake-streaming aliases when the switch is
     // off or the alias does not target the express channel.
@@ -153,7 +162,7 @@ async fn handle_chat(state: &AppState, body: &Value) -> Result<Response, ApiErro
         let rx = if ir.bypass {
             pipeline::run_bypass(&state.ctx, &ir, payload, em).await
         } else {
-            pipeline::run_stream(&state.ctx, channel, &ir, payload, em).await
+            pipeline::run_stream(&state.ctx, channel, &ir, payload, received_at, em).await
         };
         Ok((
             StatusCode::OK,
@@ -166,7 +175,9 @@ async fn handle_chat(state: &AppState, body: &Value) -> Result<Response, ApiErro
             .into_response())
     } else {
         let em = emit::OaiEmitter::new(&ir.model, ir.include_usage, &ir.prefill, false);
-        match pipeline::run_nonstream(&state.ctx, channel, &ir, payload, Box::new(em)).await {
+        match pipeline::run_nonstream(&state.ctx, channel, &ir, payload, received_at, Box::new(em))
+            .await
+        {
             Ok(v) => Ok((StatusCode::OK, Json(v)).into_response()),
             Err(e) => Ok(upstream_error_response(&e)),
         }

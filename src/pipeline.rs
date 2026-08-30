@@ -194,6 +194,7 @@ pub async fn run_stream(
     channel: Channel,
     ir: &crate::ir::Ir,
     payload: Value,
+    received_at: Instant,
     mut em: Box<dyn PortEmitter>,
 ) -> mpsc::Receiver<Result<Bytes, std::convert::Infallible>> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::convert::Infallible>>(64);
@@ -220,9 +221,16 @@ pub async fn run_stream(
         };
         let mut attempt: u32 = 0; // retries used so far
         let mut emitted = false;
+        // Gateway-own pre-upstream cost (owner request 2026-08-30): request
+        // received → dispatched. Measured once on the first attempt — a retry
+        // would fold its backoff wait in and stop meaning anything.
+        let mut prep_us: Option<u64> = None;
         'outer: loop {
             // TTFB baseline: reset per attempt (a retry restarts the clock).
             let started = Instant::now();
+            if prep_us.is_none() {
+                prep_us = Some(started.saturating_duration_since(received_at).as_micros() as u64);
+            }
             // Stream-summary bookkeeping (owner request 2026-08-30), per
             // attempt like the clock: when the first token landed and how
             // many output tokens the usage trailer reported.
@@ -322,6 +330,7 @@ pub async fn run_stream(
                     tracing::info!(
                         channel = channel_name(channel),
                         model = %model,
+                        prep_us = prep_us.unwrap_or_default(),
                         ttfb_ms = started.elapsed().as_millis() as u64,
                         "upstream first response"
                     );
@@ -468,6 +477,7 @@ pub async fn run_nonstream(
     channel: Channel,
     ir: &crate::ir::Ir,
     payload: Value,
+    received_at: Instant,
     mut em: Box<dyn PortEmitter>,
 ) -> Result<Value, UpstreamError> {
     let cfg = ctx.config.clone();
@@ -479,9 +489,15 @@ pub async fn run_nonstream(
     let model = ir.model.clone();
     let mut attempt: u32 = 0;
     let mut emitted = false;
+    // Gateway-own pre-upstream cost: request received → dispatched, measured
+    // once on the first attempt (a retry would fold its backoff wait in).
+    let mut prep_us: Option<u64> = None;
     'outer: loop {
         // TTFB baseline: reset per attempt (a retry restarts the clock).
         let started = Instant::now();
+        if prep_us.is_none() {
+            prep_us = Some(started.saturating_duration_since(received_at).as_micros() as u64);
+        }
         let mut stream = match client.start(&payload, &model, false).await {
             Ok(s) => s,
             Err(e) => {
@@ -536,6 +552,7 @@ pub async fn run_nonstream(
                 tracing::info!(
                     channel = channel_name(channel),
                     model = %model,
+                    prep_us = prep_us.unwrap_or_default(),
                     ttfb_ms = started.elapsed().as_millis() as u64,
                     "upstream first response"
                 );
