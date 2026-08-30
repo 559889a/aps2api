@@ -9,20 +9,28 @@
 //! escape handling). One unterminated object is capped at MAX_SCAN_BUFFER
 //! bytes: protocol runaway drops the buffer and flags the scanner so the
 //! pump can fail the stream instead of growing memory without bound.
+//!
+//! The scanner is BYTE-native on purpose: a multi-byte UTF-8 sequence split
+//! across TCP chunk boundaries must never be decoded per chunk (lossy-
+//! decoding a fragment plants U+FFFD into the text — 2026-08-30 live bug).
+//! The state machine only inspects ASCII structural bytes (`{ } " \\`);
+//! bytes >= 0x80 are inert, so feeding raw bytes is equivalent. A yielded
+//! object is COMPLETE (its closing `}` was received), so its byte range
+//! always contains whole multi-byte sequences and parses losslessly.
 
 /// Cap for one buffered top-level object (the incomplete object pending
 /// across chunks). batchGraphql chunks carry at most a few MB (base64
 /// images); 64MB is far beyond anything legitimate.
 pub const MAX_SCAN_BUFFER: usize = 64 * 1024 * 1024;
 
-/// Feed bytes; yields each complete top-level JSON object as a
+/// Feed raw bytes; yields each complete top-level JSON object as a
 /// (start, end) INCLUSIVE byte range into the scanner's buffer — read it
 /// zero-copy via [`JsonStreamScanner::object`]. Ranges are valid until the
 /// next `feed` call (the drain reclaims consumed bytes); consumed bytes are
 /// dropped lazily at the next call.
 #[derive(Debug)]
 pub struct JsonStreamScanner {
-    buf: String,
+    buf: Vec<u8>,
     /// Bytes before this index are dead (garbage or consumed objects);
     /// drained at the start of the next feed.
     consumed: usize,
@@ -68,7 +76,7 @@ impl JsonStreamScanner {
         self.overflowed
     }
 
-    pub fn feed(&mut self, chunk: &str) -> Vec<(usize, usize)> {
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<(usize, usize)> {
         // Drop dead bytes from previous rounds first: the buffer only ever
         // holds live data, bounded by max_buffer + one chunk.
         if self.consumed > 0 {
@@ -79,10 +87,10 @@ impl JsonStreamScanner {
             }
             self.consumed = 0;
         }
-        self.buf.push_str(chunk);
+        self.buf.extend_from_slice(chunk);
 
         let mut out = Vec::new();
-        let bytes = self.buf.as_bytes();
+        let bytes = self.buf.as_slice();
         let (mut depth, mut in_string, mut escape) = (self.depth, self.in_string, self.escape);
         let mut object_start = self.object_start;
         let mut consumed = self.consumed;
@@ -152,9 +160,11 @@ impl JsonStreamScanner {
         out
     }
 
-    /// Borrow one yielded object's text (zero copy) by its (start, end)
-    /// range from the last `feed` call.
-    pub fn object(&self, range: (usize, usize)) -> &str {
+    /// Borrow one yielded object's bytes (zero copy) by its (start, end)
+    /// range from the last `feed` call. A yielded object is complete by
+    /// construction, so the slice is valid UTF-8 end to end — parse it with
+    /// `serde_json::from_slice`.
+    pub fn object(&self, range: (usize, usize)) -> &[u8] {
         &self.buf[range.0..=range.1]
     }
 
@@ -174,9 +184,9 @@ mod tests {
         let mut s = JsonStreamScanner::new();
         let mut out = Vec::new();
         for c in chunks {
-            for range in s.feed(c) {
+            for range in s.feed(c.as_bytes()) {
                 out.push(
-                    serde_json::from_str(s.object(range)).expect("scanner produced invalid JSON"),
+                    serde_json::from_slice(s.object(range)).expect("scanner produced invalid JSON"),
                 );
             }
         }
@@ -250,11 +260,11 @@ mod tests {
     #[test]
     fn leading_partial_then_complete() {
         let mut s = JsonStreamScanner::new();
-        assert!(s.feed(r#"    {"partial":""#).is_empty()); // incomplete, buffered
+        assert!(s.feed(r#"    {"partial":""#.as_bytes()).is_empty()); // incomplete, buffered
         let v: Vec<Value> = s
-            .feed(r#"done"}{"next":1}"#)
+            .feed(r#"done"}{"next":1}"#.as_bytes())
             .iter()
-            .map(|r| serde_json::from_str(s.object(*r)).expect("valid JSON"))
+            .map(|r| serde_json::from_slice(s.object(*r)).expect("valid JSON"))
             .collect();
         s.finish();
         assert_eq!(v.len(), 2);
@@ -267,11 +277,11 @@ mod tests {
         // The `\\` escape pair sits exactly on the chunk boundary: feed1
         // carries the first backslash, feed2 the second + the closing quote.
         let mut s = JsonStreamScanner::new();
-        assert!(s.feed(r#"{"s":"x\"#).is_empty());
+        assert!(s.feed(r#"{"s":"x\"#.as_bytes()).is_empty());
         let v: Vec<Value> = s
-            .feed(r#"\"}{"y":1}"#)
+            .feed(r#"\"}{"y":1}"#.as_bytes())
             .iter()
-            .map(|r| serde_json::from_str(s.object(*r)).expect("valid JSON"))
+            .map(|r| serde_json::from_slice(s.object(*r)).expect("valid JSON"))
             .collect();
         s.finish();
         assert_eq!(v.len(), 2);
@@ -280,16 +290,44 @@ mod tests {
     }
 
     #[test]
+    fn multibyte_char_split_across_chunks_survives() {
+        // U+FFFD regression (2026-08-30 live bug): a multi-byte UTF-8
+        // sequence cut by the chunk boundary must be buffered at BYTE level
+        // and decoded only once complete. "你" is 3 bytes, "😀" is 4 — the
+        // brute force below cuts inside both of them (and everywhere else).
+        let body =
+            r#"{"results":[{"data":{"candidates":[{"content":{"parts":[{"text":"你😀好"}]}}]}}]}"#;
+        let bytes = body.as_bytes();
+        for split in 1..bytes.len() {
+            let mut s = JsonStreamScanner::new();
+            let mut out = Vec::new();
+            for range in s.feed(&bytes[..split]) {
+                out.push(serde_json::from_slice::<Value>(s.object(range)).unwrap());
+            }
+            for range in s.feed(&bytes[split..]) {
+                out.push(serde_json::from_slice::<Value>(s.object(range)).unwrap());
+            }
+            s.finish();
+            assert_eq!(out.len(), 1, "split at byte {split}");
+            assert_eq!(
+                out[0]["results"][0]["data"]["candidates"][0]["content"]["parts"][0]["text"],
+                "你😀好",
+                "split at byte {split}"
+            );
+        }
+    }
+
+    #[test]
     fn oversized_incomplete_object_is_capped_and_resyncs() {
         let mut s = JsonStreamScanner::with_limit(16);
         let junk = format!(r#"{{"a":"{}"#, "x".repeat(64));
-        assert!(s.feed(&junk).is_empty());
+        assert!(s.feed(junk.as_bytes()).is_empty());
         assert!(s.overflowed());
         // The buffer was dropped; a fresh complete object still parses.
         let v: Vec<Value> = s
-            .feed(r#"{"b":2}"#)
+            .feed(r#"{"b":2}"#.as_bytes())
             .iter()
-            .map(|r| serde_json::from_str(s.object(*r)).expect("valid JSON"))
+            .map(|r| serde_json::from_slice(s.object(*r)).expect("valid JSON"))
             .collect();
         s.finish();
         assert_eq!(v.len(), 1);
@@ -300,12 +338,12 @@ mod tests {
     fn noise_never_trips_the_overflow_guard() {
         let mut s = JsonStreamScanner::with_limit(16);
         let junk = "n".repeat(256);
-        assert!(s.feed(&junk).is_empty());
+        assert!(s.feed(junk.as_bytes()).is_empty());
         assert!(!s.overflowed(), "droppable noise must not trip the cap");
         let v: Vec<Value> = s
-            .feed(r#"{"ok":1}"#)
+            .feed(r#"{"ok":1}"#.as_bytes())
             .iter()
-            .map(|r| serde_json::from_str(s.object(*r)).expect("valid JSON"))
+            .map(|r| serde_json::from_slice(s.object(*r)).expect("valid JSON"))
             .collect();
         s.finish();
         assert_eq!(v.len(), 1);
@@ -318,8 +356,8 @@ mod tests {
         // Each object is bigger than the cap but completes immediately.
         for n in 0..4 {
             let chunk = format!(r#"{{"n":{n},"pad":"{}"}}"#, "p".repeat(64));
-            for range in s.feed(&chunk) {
-                out.push(serde_json::from_str::<Value>(s.object(range)).unwrap());
+            for range in s.feed(chunk.as_bytes()) {
+                out.push(serde_json::from_slice::<Value>(s.object(range)).unwrap());
             }
         }
         assert!(!s.overflowed());

@@ -100,7 +100,9 @@ pub(crate) const MAX_SSE_LINE: usize = 64 * 1024 * 1024;
 
 /// SSE pump (spec §13.3): one `data: <json>` per event; comment and empty
 /// lines ignored; no `[DONE]` marker in the Gemini protocol. Lines are
-/// parsed in place (borrowed from the buffer — no per-line allocation).
+/// decoded from COMPLETE line bytes only (byte-level buffering — a
+/// multi-byte UTF-8 sequence split across chunk boundaries must never be
+/// lossy-decoded per chunk; see the buffer note below).
 pub(crate) async fn pump_sse<S, E>(stream: S, tx: mpsc::Sender<Ev>)
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -114,19 +116,26 @@ where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
-    let mut buf = String::new();
+    // BYTE buffer, never a String: a multi-byte UTF-8 sequence split across
+    // TCP chunk boundaries must not be decoded per chunk — lossy-decoding a
+    // fragment plants U+FFFD into the text (2026-08-30 live bug, occasional
+    // `�` in upstream text). Complete lines only: b'\n' can never occur
+    // inside a multi-byte sequence (continuation bytes are >= 0x80), so
+    // line-wise decoding is boundary-safe, and a trailing partial line stays
+    // raw bytes until its next chunk completes it.
+    let mut buf: Vec<u8> = Vec::new();
     loop {
         match stream.next().await {
             Some(Ok(bytes)) => {
-                buf.push_str(&String::from_utf8_lossy(&bytes));
+                buf.extend_from_slice(&bytes);
                 // Walk every complete line in place via a cursor, then reclaim
                 // them all with ONE drain: draining per line memmoves the rest
                 // of the chunk on each iteration — O(chunk^2) for line-heavy
                 // chunks (many small SSE events coalesced by TCP).
                 let mut consumed = 0usize;
-                while let Some(rel) = buf[consumed..].find('\n') {
+                while let Some(rel) = buf[consumed..].iter().position(|&b| b == b'\n') {
                     let pos = consumed + rel;
-                    let line = &buf[consumed..pos];
+                    let line = String::from_utf8_lossy(&buf[consumed..pos]);
                     if let Some(data) = line.strip_prefix("data:") {
                         let data = data.trim();
                         if !data.is_empty() && data != "[DONE]" {
@@ -168,7 +177,9 @@ where
 /// Concatenated-JSON pump (spec §13.1): batchGraphql streams consecutive
 /// top-level JSON objects; the bracket-balancing scanner extracts them as
 /// borrowed slices and the channel-specific `extract` callback turns each
-/// object into events.
+/// object into events. Raw bytes go in untouched — the scanner is
+/// byte-native, and each yielded object is decoded from its COMPLETE byte
+/// range, so multi-byte chars split across chunks survive intact.
 pub(crate) async fn pump_concat<S, E, F>(mut stream: S, tx: mpsc::Sender<Ev>, mut extract: F)
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
@@ -179,9 +190,8 @@ where
     loop {
         match stream.next().await {
             Some(Ok(bytes)) => {
-                let chunk = String::from_utf8_lossy(&bytes);
-                for range in scanner.feed(&chunk) {
-                    match serde_json::from_str::<Value>(scanner.object(range)) {
+                for range in scanner.feed(&bytes) {
+                    match serde_json::from_slice::<Value>(scanner.object(range)) {
                         Ok(v) => {
                             let mut events = Vec::new();
                             extract(&v, &mut events);
@@ -414,6 +424,54 @@ mod tests {
         assert_eq!(seen.len(), 50);
         for (i, t) in seen.iter().enumerate() {
             assert_eq!(t, &i.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn multibyte_chars_survive_any_chunk_split_sse() {
+        // U+FFFD regression (2026-08-30): the pumps used to lossy-decode each
+        // TCP chunk separately, corrupting a multi-byte char cut by the chunk
+        // boundary into U+FFFD. Brute force: cut the SSE body at EVERY byte
+        // offset (inside "你" = 3 bytes and "😀" = 4 bytes included).
+        let body = format!(
+            "data: {}\n\n",
+            r#"{"candidates":[{"content":{"parts":[{"text":"你😀好"}]}}]}"#
+        );
+        let bytes = body.as_bytes().to_vec();
+        for split in 1..bytes.len() {
+            let (tx, mut rx) = mpsc::channel::<Ev>(8);
+            let stream = futures_util::stream::iter(vec![
+                Ok::<Bytes, std::convert::Infallible>(Bytes::copy_from_slice(&bytes[..split])),
+                Ok::<Bytes, std::convert::Infallible>(Bytes::copy_from_slice(&bytes[split..])),
+            ]);
+            pump_sse_with_limit(stream, tx, 1 << 20).await;
+            match rx.recv().await {
+                Some(Ev::Text(t)) => assert_eq!(t, "你😀好", "split at byte {split}"),
+                other => panic!("split at byte {split}: expected text event, got {other:?}"),
+            }
+            assert!(rx.recv().await.is_none(), "split at byte {split}");
+        }
+    }
+
+    #[tokio::test]
+    async fn multibyte_chars_survive_any_chunk_split_concat() {
+        // Same regression through the cookie channel's real extractor
+        // (batchGraphql wrapper -> extract_from_chunk).
+        let body =
+            r#"{"results":[{"data":{"candidates":[{"content":{"parts":[{"text":"你😀好"}]}}]}}]}"#;
+        let bytes = body.as_bytes().to_vec();
+        for split in 1..bytes.len() {
+            let (tx, mut rx) = mpsc::channel::<Ev>(8);
+            let stream = futures_util::stream::iter(vec![
+                Ok::<Bytes, std::convert::Infallible>(Bytes::copy_from_slice(&bytes[..split])),
+                Ok::<Bytes, std::convert::Infallible>(Bytes::copy_from_slice(&bytes[split..])),
+            ]);
+            pump_concat(stream, tx, cookie::cookie_extract).await;
+            match rx.recv().await {
+                Some(Ev::Text(t)) => assert_eq!(t, "你😀好", "split at byte {split}"),
+                other => panic!("split at byte {split}: expected text event, got {other:?}"),
+            }
+            assert!(rx.recv().await.is_none(), "split at byte {split}");
         }
     }
 
