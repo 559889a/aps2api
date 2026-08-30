@@ -1,6 +1,6 @@
 [package]
 name = "aps2api"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Vertex Gemini 2api proxy: express + cookie dual upstream, OAI & Gemini native endpoints"
