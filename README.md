@@ -125,6 +125,8 @@ aps2api/
 ├── config.example.yaml      # all-empty commented config template
 ├── model.json               # default three-model example list
 ├── .github/workflows/ci.yml # fmt/clippy/test + three-platform debug builds
+├── examples/
+│   └── tls_check.rs        # TLS-fingerprint self-check vs a real Chrome (appendix C.4)
 └── src/
     ├── main.rs              # boot: load config + model list, axum serve, request log
     ├── config.rs            # config.yaml / model.json loading and validation
