@@ -93,6 +93,7 @@ fn transport_err(message: String) -> Ev {
         kind: ErrorKind::Transport,
         status: None,
         message,
+        jar_refreshed_since_send: false,
     })
 }
 
@@ -161,6 +162,7 @@ where
                             message: format!(
                                 "upstream SSE line exceeded the buffer limit ({max_line} bytes)"
                             ),
+                            jar_refreshed_since_send: false,
                         }))
                         .await;
                     return;
@@ -275,6 +277,7 @@ pub(crate) async fn pump_single_with_limit<S, E>(
                                 "upstream response body exceeded the buffer limit \
                                  ({max_bytes} bytes)"
                             ),
+                            jar_refreshed_since_send: false,
                         }))
                         .await;
                     return;

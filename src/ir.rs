@@ -152,6 +152,12 @@ pub struct UpstreamError {
     /// Upstream HTTP status when known (retries exhausted -> pass through).
     pub status: Option<u16>,
     pub message: String,
+    /// Cookie auto-refresh self-heal hint (spec §7.4): true when the cookie
+    /// jar rolled (Set-Cookie rewrites merged) after the failed request was
+    /// sent — the credentials that request used are stale, so one retry with
+    /// the fresh jar is likely to succeed. Set by the cookie channel on AUTH
+    /// failures; consumed by the pipeline's one-shot self-heal retry.
+    pub jar_refreshed_since_send: bool,
 }
 
 impl UpstreamError {

@@ -36,9 +36,24 @@ impl AppState {
             // Startup validation (spec §7.1): SAPISID family mandatory.
             crate::sapisid::validate_cookie(&config.cookie.cookie)?;
             let client = httpx::build_cookie_client(&config)?;
+            // Cookie auto-refresh (spec §7.4): the jar persists rolled
+            // credentials next to the binary and harvests Set-Cookie
+            // rewrites on every response.
+            let jar = if config.cookie.auto_refresh {
+                let jar = crate::cookiejar::CookieJar::load(&config.cookie.cookie);
+                tracing::info!(
+                    auto_refresh = true,
+                    "cookie auto-refresh enabled (jar persists to cookie.jar.yaml)"
+                );
+                Some(std::sync::Arc::new(jar))
+            } else {
+                tracing::info!("cookie auto-refresh disabled: startup string is frozen");
+                None
+            };
             Some(UpstreamClient::Cookie(CookieClient::new(
                 client,
                 &config.cookie,
+                jar,
             )))
         } else {
             None

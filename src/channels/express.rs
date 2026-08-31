@@ -113,6 +113,7 @@ fn map_send_err(e: reqwest::Error) -> UpstreamError {
             kind: ErrorKind::Transport,
             status: None,
             message,
+            jar_refreshed_since_send: false,
         }
     } else {
         errs::classify_error(None, message)

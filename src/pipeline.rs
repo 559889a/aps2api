@@ -216,6 +216,7 @@ pub async fn run_stream(
                     kind: ErrorKind::Invalid,
                     status: Some(400),
                     message: e.message,
+                    jar_refreshed_since_send: false,
                 }) {
                     if tx.send(Ok(b)).await.is_err() {
                         return;
@@ -226,6 +227,8 @@ pub async fn run_stream(
         };
         let mut attempt: u32 = 0; // retries used so far
         let mut emitted = false;
+        // One-shot cookie self-heal latch (spec §7.4).
+        let mut self_healed = false;
         // Gateway-own pre-upstream cost (owner request 2026-08-30): request
         // received → dispatched. Measured once on the first attempt — a retry
         // would fold its backoff wait in and stop meaning anything.
@@ -272,6 +275,19 @@ pub async fn run_stream(
                         }
                         continue 'outer;
                     }
+                    // Cookie self-heal (spec §7.4): a non-retryable AUTH
+                    // failure whose jar rolled mid-flight means the request
+                    // ran on stale credentials — exactly one extra retry on
+                    // the fresh jar, outside the retry.max budget.
+                    if !emitted && e.jar_refreshed_since_send && !self_healed {
+                        self_healed = true;
+                        tracing::warn!(
+                            channel = channel_name(channel),
+                            model = %model,
+                            "auth failed with rolled credentials; retrying once on the refreshed cookie jar"
+                        );
+                        continue 'outer;
+                    }
                     log_give_up(channel, &model, attempt, cfg.retry.max, emitted, &e);
                     for b in em.on_error(&e) {
                         if tx.send(Ok(b)).await.is_err() {
@@ -313,6 +329,7 @@ pub async fn run_stream(
                         kind: ErrorKind::Transport,
                         status: None,
                         message: "upstream did not produce any content within the first-response budget (30s)".into(),
+                        jar_refreshed_since_send: false,
                     };
                     log_give_up(channel, &model, attempt, cfg.retry.max, false, &e);
                     for b in em.on_error(&e) {
@@ -490,10 +507,13 @@ pub async fn run_nonstream(
         kind: ErrorKind::Invalid,
         status: Some(400),
         message: e.message,
+        jar_refreshed_since_send: false,
     })?;
     let model = ir.model.clone();
     let mut attempt: u32 = 0;
     let mut emitted = false;
+    // One-shot cookie self-heal latch (spec §7.4).
+    let mut self_healed = false;
     // Gateway-own pre-upstream cost: request received → dispatched, measured
     // once on the first attempt (a retry would fold its backoff wait in).
     let mut prep_us: Option<u64> = None;
@@ -517,6 +537,17 @@ pub async fn run_nonstream(
                         &e.message,
                     );
                     backoff_sleep(&cfg, attempt).await;
+                    continue 'outer;
+                }
+                // Cookie self-heal (spec §7.4): stale-credentials AUTH
+                // failure gets exactly one retry on the refreshed jar.
+                if !emitted && e.jar_refreshed_since_send && !self_healed {
+                    self_healed = true;
+                    tracing::warn!(
+                        channel = channel_name(channel),
+                        model = %model,
+                        "auth failed with rolled credentials; retrying once on the refreshed cookie jar"
+                    );
                     continue 'outer;
                 }
                 log_give_up(channel, &model, attempt, cfg.retry.max, emitted, &e);
@@ -544,6 +575,7 @@ pub async fn run_nonstream(
                     kind: ErrorKind::Transport,
                     status: None,
                     message: "upstream did not produce any content within the first-response budget (30s)".into(),
+                    jar_refreshed_since_send: false,
                 };
                 log_give_up(channel, &model, attempt, cfg.retry.max, false, &e);
                 return Err(e);
@@ -631,6 +663,7 @@ pub async fn run_bypass(
                     kind: ErrorKind::Invalid,
                     status: Some(400),
                     message: e.message,
+                    jar_refreshed_since_send: false,
                 }) {
                     if tx.send(Ok(b)).await.is_err() {
                         return;
@@ -719,6 +752,7 @@ pub async fn run_bypass(
                                      first-response budget ({}s)",
                                     retry::BYPASS_FIRST_RESPONSE_BUDGET.as_secs()
                                 ),
+                                jar_refreshed_since_send: false,
                             };
                             log_give_up(
                                 Channel::Express,
@@ -786,6 +820,7 @@ pub async fn run_bypass(
                                      first-response budget ({}s)",
                                     retry::BYPASS_FIRST_RESPONSE_BUDGET.as_secs()
                                 ),
+                                jar_refreshed_since_send: false,
                             });
                         }
                         // Keep-alive + disconnect detection (3s granularity).
@@ -808,6 +843,7 @@ pub async fn run_bypass(
                         "bypass aggregated events exceeded the buffer limit \
                          ({MAX_BYPASS_EVENTS_BYTES} bytes)"
                     ),
+                    jar_refreshed_since_send: false,
                 };
                 log_give_up(Channel::Express, &model, attempt, cfg.retry.max, false, &e);
                 for b in em.on_error(&e) {

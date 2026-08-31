@@ -51,7 +51,7 @@ fn default_location() -> String {
     "global".to_string()
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CookieConfig {
     #[serde(default)]
     pub cookie: String,
@@ -59,6 +59,28 @@ pub struct CookieConfig {
     pub project_id: String,
     #[serde(default)]
     pub experiment_flags: String,
+    /// Cookie auto-refresh switch (spec §7.4): harvest Set-Cookie rewrites
+    /// into the runtime jar + persist to cookie.jar.yaml + one self-heal
+    /// retry on AUTH failures. Default true (opt-out).
+    #[serde(default = "default_true")]
+    pub auto_refresh: bool,
+}
+
+impl Default for CookieConfig {
+    fn default() -> Self {
+        // Keep the derive-equivalent struct default in sync with the serde
+        // default (auto_refresh on) so both construction paths agree.
+        CookieConfig {
+            cookie: String::new(),
+            project_id: String::new(),
+            experiment_flags: String::new(),
+            auto_refresh: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

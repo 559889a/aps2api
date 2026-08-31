@@ -87,6 +87,7 @@ pub fn classify_error(status: Option<u16>, message: impl Into<String>) -> Upstre
         kind,
         status,
         message,
+        jar_refreshed_since_send: false,
     }
 }
 
@@ -95,8 +96,9 @@ pub fn user_hint(kind: ErrorKind) -> &'static str {
     match kind {
         ErrorKind::Auth => {
             "\n\n💡 Cookie 通常较为持久（只要不退出登录/改密码/被 Google 主动失效，可维持数周甚至更久）；\
-仅当确实出现权限错误时才需更新。重新获取：电脑浏览器打开 console.cloud.google.com，\
-F12 → Network，复制任意请求的 Cookie 头，更新 config.yaml 的 cookie 字段后重启。"
+自动续期已尝试刷新仍失败，说明登录态整体失效（非短期凭据滚动）。重新获取：电脑浏览器打开 \
+console.cloud.google.com，F12 → Network，复制任意请求的 Cookie 头，更新 config.yaml 的 \
+cookie 字段后重启。"
         }
         ErrorKind::Project => {
             "\n\n这看起来是**项目层面**的问题，不是 Cookie 失效，重取 Cookie 无用。请依次检查：\
@@ -193,7 +195,8 @@ mod tests {
             assert!(UpstreamError {
                 kind: k,
                 status: None,
-                message: String::new()
+                message: String::new(),
+                jar_refreshed_since_send: false,
             }
             .retryable());
         }
@@ -206,7 +209,8 @@ mod tests {
             assert!(!UpstreamError {
                 kind: k,
                 status: None,
-                message: String::new()
+                message: String::new(),
+                jar_refreshed_since_send: false,
             }
             .retryable());
         }

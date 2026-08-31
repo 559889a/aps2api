@@ -57,18 +57,37 @@ pub fn emulation() -> Emulation {
 #[derive(Clone)]
 pub struct CookieClient {
     http: wreq::Client,
-    cookie: String,
+    /// Runtime cookie jar (spec §7.4): every request rebuilds the Cookie
+    /// header from it and every response merges its Set-Cookie rewrites
+    /// back in. `None` = auto_refresh disabled (frozen startup string).
+    jar: Option<crate::cookiejar::SharedCookieJar>,
+    /// Frozen cookie string for the auto_refresh=false mode (and tests).
+    frozen_cookie: String,
     project_id: String,
     experiment_flags: String,
 }
 
 impl CookieClient {
-    pub fn new(http: wreq::Client, cfg: &CookieConfig) -> Self {
+    pub fn new(
+        http: wreq::Client,
+        cfg: &CookieConfig,
+        jar: Option<crate::cookiejar::SharedCookieJar>,
+    ) -> Self {
         CookieClient {
             http,
-            cookie: cfg.cookie.clone(),
+            jar,
+            frozen_cookie: cfg.cookie.clone(),
             project_id: cfg.project_id.trim().to_string(),
             experiment_flags: cfg.experiment_flags.clone(),
+        }
+    }
+
+    /// Current cookie header string: the jar's live value when
+    /// auto-refresh is on, the frozen config string otherwise.
+    fn cookie_header(&self) -> String {
+        match &self.jar {
+            Some(jar) => jar.cookie_header(),
+            None => self.frozen_cookie.clone(),
         }
     }
 
@@ -132,9 +151,12 @@ impl CookieClient {
         out
     }
 
-    /// The §6.2 header set, in fixed order, rebuilt for every attempt.
+    /// The §6.2 header set, in fixed order, rebuilt for every attempt. The
+    /// cookie / authorization pair is computed from the jar's CURRENT value
+    /// (spec §7.4: rolled credentials take effect on the next request).
     fn headers(&self) -> wreq::header::HeaderMap {
         use wreq::header::{HeaderMap, HeaderName, HeaderValue};
+        let cookie = self.cookie_header();
         let mut m = HeaderMap::new();
         let mut put = |name: &'static str, value: &str| {
             if let Ok(v) = HeaderValue::from_str(value) {
@@ -147,17 +169,14 @@ impl CookieClient {
         put("content-type", "application/json");
         put("x-goog-authuser", "0");
         put("x-same-domain", "1");
-        put(
-            "authorization",
-            &sapisid::authorization_header(&self.cookie),
-        );
+        put("authorization", &sapisid::authorization_header(&cookie));
         // No `x-origin` here — see the XD3 red-line note above.
         put("origin", ORIGIN);
         put("referer", "https://console.cloud.google.com/");
         put("accept", "*/*");
         put("accept-encoding", "gzip, deflate, br, zstd");
         put("accept-language", "zh-CN,zh;q=0.9,en;q=0.8");
-        put("cookie", &self.cookie);
+        put("cookie", &cookie);
         put("user-agent", USER_AGENT);
         put("sec-fetch-site", "same-origin");
         put("sec-fetch-mode", "cors");
@@ -169,6 +188,10 @@ impl CookieClient {
     /// batchGraphql surface has a single operation (StreamGenerateContent,
     /// §7.2) — non-streaming requests are served by the pipeline aggregating
     /// this event stream and replying with the complete JSON (run_nonstream).
+    ///
+    /// Set-Cookie auto-refresh (spec §7.4): every response — 2xx or not —
+    /// has its Set-Cookie rewrites merged into the jar, so short-lived
+    /// credentials keep rolling without ever re-copying cookies by hand.
     pub async fn start(
         &self,
         payload: &Value,
@@ -177,6 +200,7 @@ impl CookieClient {
     ) -> Result<EvStream, UpstreamError> {
         crate::channels::express::log_outbound(payload);
         let body = self.build_body(payload, model);
+        let sent_revision = self.jar.as_ref().map(|j| j.revision());
         let resp = self
             .http
             .post(BATCHGRAPHQL_URL)
@@ -185,14 +209,23 @@ impl CookieClient {
             .send()
             .await
             .map_err(map_send_err)?;
+        self.absorb_set_cookies(&resp);
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
             let text = resp.text().await.unwrap_or_default();
             tracing::debug!(status, upstream_body = %text, "batchGraphql non-2xx");
-            return Err(errs::classify_error(
-                Some(status),
-                cookie_error_message(&text),
-            ));
+            let mut e = errs::classify_error(Some(status), cookie_error_message(&text));
+            // AUTH self-heal hint (§7.4): mark the error when the jar rolled
+            // while this request was in flight — the pipeline turns that
+            // into exactly one retry with the fresh credentials.
+            if e.kind == ErrorKind::Auth {
+                if let (Some(jar), Some(sent)) = (&self.jar, sent_revision) {
+                    if jar.revision() != sent {
+                        e.jar_refreshed_since_send = true;
+                    }
+                }
+            }
+            return Err(e);
         }
         let (tx, rx) = mpsc::channel::<Ev>(64);
         tokio::spawn(crate::channels::pump_concat(
@@ -201,6 +234,22 @@ impl CookieClient {
             cookie_extract,
         ));
         Ok(EvStream::new(rx))
+    }
+
+    /// Merge every Set-Cookie header of one response into the jar.
+    fn absorb_set_cookies(&self, resp: &wreq::Response) {
+        let Some(jar) = &self.jar else {
+            return;
+        };
+        let headers: Vec<String> = resp
+            .headers()
+            .get_all(wreq::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_string))
+            .collect();
+        if jar.merge_set_cookies(&headers) {
+            tracing::debug!("cookie jar updated from Set-Cookie rewrites");
+        }
     }
 }
 
@@ -219,6 +268,7 @@ fn classify_send_failure(is_connect: bool, is_timeout: bool, message: String) ->
             kind: ErrorKind::Transport,
             status: None,
             message,
+            jar_refreshed_since_send: false,
         }
     } else {
         errs::classify_error(None, message)
@@ -288,7 +338,9 @@ mod tests {
                 cookie: "SAPISID=x".into(),
                 project_id: "proj".into(),
                 experiment_flags: "flags".into(),
+                auto_refresh: false,
             },
+            None,
         );
         let payload = json!({
             "contents": [{"role": "user", "parts": []}],
@@ -323,7 +375,9 @@ mod tests {
                 cookie: String::new(),
                 project_id: "p".into(),
                 experiment_flags: String::new(),
+                auto_refresh: false,
             },
+            None,
         );
         let a = c.request_context();
         let b = c.request_context();
@@ -340,7 +394,9 @@ mod tests {
                 cookie: "SAPISID=x".into(),
                 project_id: "p".into(),
                 experiment_flags: String::new(),
+                auto_refresh: false,
             },
+            None,
         );
         let names: Vec<String> = c.headers().keys().map(|k| k.as_str().to_string()).collect();
         for required in [
@@ -389,7 +445,9 @@ mod tests {
                 cookie: "SAPISID=x".into(),
                 project_id: "proj".into(),
                 experiment_flags: String::new(),
+                auto_refresh: false,
             },
+            None,
         );
         let payload = json!({ "contents": [{ "role": "user", "parts": [] }] });
         let body: Value = serde_json::from_str(&c.build_body(&payload, "m")).unwrap();

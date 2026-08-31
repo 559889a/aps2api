@@ -27,6 +27,9 @@ cookie:
   project_id: ""                    # project that works in Vertex AI Studio for this account
   experiment_flags: ""              # experimentFlagsBinary — copy the whole batchGraphql request body field
                                     # from DevTools (F12); relatively stable
+  auto_refresh: true                # cookie auto-refresh: harvest Set-Cookie rewrites from every response
+                                    # into a runtime jar (persisted to cookie.jar.yaml next to the binary) and
+                                    # retry once on auth failures when the jar rolled. false = frozen startup string
 
 # ============ Thinking level ============
 # Forced thinking level: minimal | low | medium | high, empty = not forced.

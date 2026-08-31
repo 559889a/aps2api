@@ -8,6 +8,7 @@ mod app;
 mod auth;
 mod channels;
 mod config;
+mod cookiejar;
 mod errs;
 mod gemini_port;
 mod httpx;

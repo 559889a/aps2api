@@ -391,6 +391,7 @@ mod tests {
             kind: crate::ir::ErrorKind::RateLimit,
             status: Some(429),
             message: "quota".into(),
+            jar_refreshed_since_send: false,
         };
         let out = em.on_error(&e);
         let joined = out

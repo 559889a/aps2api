@@ -334,6 +334,7 @@ mod tests {
             kind: ErrorKind::Auth,
             status: Some(403),
             message: "permission denied".into(),
+            jar_refreshed_since_send: false,
         };
         let out = em.on_error(&e);
         let s = String::from_utf8_lossy(&out[0]);

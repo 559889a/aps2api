@@ -48,6 +48,12 @@ the response back in the client's protocol.
   `fake-streaming/express/<model>` aliases: the client gets a real SSE stream with
   keep-alive heartbeats during the silent wait, while the upstream runs as a single
   non-streaming call whose complete answer is replayed in one burst.
+- **Cookie auto-refresh** — the cookie channel harvests `Set-Cookie` rewrites from
+  every upstream response into a runtime jar (persisted to `cookie.jar.yaml` next to
+  the binary), so short-lived Google credentials keep rolling without ever
+  re-copying cookies by hand; an auth failure that arrived while credentials were
+  rolling is retried once on the refreshed jar automatically. Opt out with
+  `cookie.auto_refresh: false`.
 - **Local API key auth** and a global **authenticated SOCKS5 proxy** option
   (`socks5://user:pass@host:port`) that applies to every upstream connection.
 
@@ -132,6 +138,7 @@ All settings live in `config.yaml` next to the binary; see the heavily commented
 | `socks5` | global outbound SOCKS5 proxy (commented out = direct); supports `user:pass@` and `socks5h://` |
 | `express.api_key` / `express.project_id` / `express.location` | Express channel credentials; keep `location: global` |
 | `cookie.cookie` / `cookie.project_id` / `cookie.experiment_flags` | cookie channel credentials |
+| `cookie.auto_refresh` | cookie auto-refresh (default `true`): harvest `Set-Cookie` rewrites into a jar persisted to `cookie.jar.yaml`; `false` freezes the startup string |
 | `thinking_level` | forced thinking level: `minimal`/`low`/`medium`/`high`, empty = family defaults |
 | `bypass` | fake-streaming aliases: when `true`, `fake-streaming/express/<model>` ids are listed and served (SSE to the client, non-streaming to the express upstream, heartbeat-bridged); default `false` |
 | `retry.max` / `retry.strategy` / `retry.interval` | retry count (`max+1` attempts total), `fixed`/`backoff`, fixed interval seconds |
@@ -212,6 +219,7 @@ aps2api/
     ├── app.rs                       # AppState assembly: config + model list + outbound clients
     ├── auth.rs                      # local API key middleware (Bearer / x-goog-api-key)
     ├── config.rs                    # config.yaml / model.json loading and validation
+    ├── cookiejar.rs                 # cookie auto-refresh jar: Set-Cookie merge + persistence (§7.4)
     ├── errs.rs                      # upstream error taxonomy (§14) + user-facing hints
     ├── gemini_port/
     │   ├── mod.rs                   # /v1beta dispatch: %2F decode, prefix pass-through, routes
