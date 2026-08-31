@@ -228,20 +228,22 @@ fn classify_send_failure(is_connect: bool, is_timeout: bool, message: String) ->
 /// batchGraphql response wrapper -> events (spec §13.2, cookie side):
 /// top-level `error` -> Error; `results[]`: item `errors` -> first error,
 /// item `data` -> standard Gemini chunk.
-pub fn cookie_extract(obj: &Value, out: &mut Vec<Ev>) {
-    if let Some(err) = obj.get("error") {
-        out.push(Ev::Error(error_from_value(err)));
+pub fn cookie_extract(obj: &mut Value, out: &mut Vec<Ev>) {
+    if let Some(err) = obj.get_mut("error").map(Value::take) {
+        if !err.is_null() {
+            out.push(Ev::Error(error_from_value(&err)));
+        }
     }
-    if let Some(results) = obj.get("results").and_then(Value::as_array) {
+    if let Some(results) = obj.get_mut("results").and_then(Value::as_array_mut) {
         for r in results {
-            if let Some(errs) = r.get("errors").and_then(Value::as_array) {
-                if let Some(first) = errs.first() {
+            if let Some(errs) = r.get_mut("errors").and_then(Value::as_array_mut) {
+                if let Some(first) = errs.first_mut() {
                     tracing::debug!(error_item = %first, "batchGraphql in-stream error");
                     out.push(Ev::Error(error_from_value(first)));
                     continue;
                 }
             }
-            if let Some(data) = r.get("data") {
+            if let Some(data) = r.get_mut("data") {
                 if data.is_object() {
                     extract_from_chunk(data, out);
                 }
@@ -361,14 +363,14 @@ mod tests {
 
     #[test]
     fn cookie_extract_maps_wrapper_to_events() {
-        let obj = json!({
+        let mut obj = json!({
             "results": [
                 { "errors": [], "data": { "candidates": [ { "content": { "parts": [ { "text": "hi" } ] } } ] } },
                 { "errors": [ { "code": 429, "message": "resource exhausted" } ] }
             ]
         });
         let mut out = Vec::new();
-        cookie_extract(&obj, &mut out);
+        cookie_extract(&mut obj, &mut out);
         assert!(matches!(&out[0], Ev::Text(t) if t == "hi"));
         assert!(matches!(&out[1], Ev::Error(e) if e.kind == ErrorKind::RateLimit));
     }
@@ -397,9 +399,9 @@ mod tests {
 
     #[test]
     fn cookie_extract_top_level_error() {
-        let obj = json!({ "error": { "code": 401, "message": "unauthenticated" } });
+        let mut obj = json!({ "error": { "code": 401, "message": "unauthenticated" } });
         let mut out = Vec::new();
-        cookie_extract(&obj, &mut out);
+        cookie_extract(&mut obj, &mut out);
         assert!(matches!(&out[0], Ev::Error(e) if e.kind == ErrorKind::Auth));
     }
 

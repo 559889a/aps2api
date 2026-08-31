@@ -65,9 +65,9 @@ fn ends_with_unspecified(s: &str) -> bool {
 
 async fn emit_json(tx: &mpsc::Sender<Ev>, data: &str) {
     match serde_json::from_str::<Value>(data) {
-        Ok(chunk) => {
+        Ok(mut chunk) => {
             let mut events = Vec::new();
-            extract_from_chunk(&chunk, &mut events);
+            extract_from_chunk(&mut chunk, &mut events);
             for ev in events {
                 if tx.send(ev).await.is_err() {
                     return;
@@ -192,9 +192,9 @@ where
             Some(Ok(bytes)) => {
                 for range in scanner.feed(&bytes) {
                     match serde_json::from_slice::<Value>(scanner.object(range)) {
-                        Ok(v) => {
+                        Ok(mut v) => {
                             let mut events = Vec::new();
-                            extract(&v, &mut events);
+                            extract(&mut v, &mut events);
                             for ev in events {
                                 if tx.send(ev).await.is_err() {
                                     return;
@@ -283,13 +283,25 @@ fn shell_part_nonempty(part: &Value, key: &str) -> bool {
 
 /// Unified chunk extraction (spec §13.2): one standard Gemini chunk ->
 /// zero or more events. `*_UNSPECIFIED` proto defaults are filtered.
-pub fn extract_from_chunk(chunk: &Value, out: &mut Vec<Ev>) {
+///
+/// Takes `&mut Value` and MOVES the fields it consumes (remove, not clone):
+/// this runs once per streamed event — a `to_string()` per text part is a
+/// heap allocation + copy on the hottest path in the process. The chunk is
+/// parsed and dropped right after; nobody re-reads it.
+pub fn extract_from_chunk(chunk: &mut Value, out: &mut Vec<Ev>) {
     // promptFeedback.blockReason (+ optional blockReasonMessage).
-    if let Some(pf) = chunk.get("promptFeedback") {
-        if let Some(reason) = pf.get("blockReason").and_then(Value::as_str) {
-            if !reason.is_empty() && !ends_with_unspecified(reason) {
-                let mut msg = reason.to_string();
-                if let Some(extra) = pf.get("blockReasonMessage").and_then(Value::as_str) {
+    if let Some(pf) = chunk
+        .get_mut("promptFeedback")
+        .and_then(Value::as_object_mut)
+    {
+        let reason = match pf.remove("blockReason") {
+            Some(Value::String(r)) => Some(r),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            if !reason.is_empty() && !ends_with_unspecified(&reason) {
+                let mut msg = reason;
+                if let Some(Value::String(extra)) = pf.remove("blockReasonMessage") {
                     if !extra.is_empty() {
                         msg = format!("{msg}: {extra}");
                     }
@@ -299,72 +311,77 @@ pub fn extract_from_chunk(chunk: &Value, out: &mut Vec<Ev>) {
         }
     }
 
-    if let Some(candidates) = chunk.get("candidates").and_then(Value::as_array) {
+    if let Some(candidates) = chunk.get_mut("candidates").and_then(Value::as_array_mut) {
         for cand in candidates {
-            if let Some(parts) = cand
-                .get("content")
-                .and_then(|c| c.get("parts"))
-                .and_then(Value::as_array)
-            {
-                for part in parts {
-                    // batchGraphql parts are proto3-style: EVERY field is
-                    // present with an empty value (functionCall.name="",
-                    // inlineData:{mimeType:"",data:""}, executableCode with
-                    // enum-default strings, ...). Text extraction runs FIRST
-                    // so shell fields can never swallow real content;
-                    // tool/code/image fields only count when they carry
-                    // actual content (live-tested 2026-08-30).
-                    if let Some(text) = part.get("text").and_then(Value::as_str) {
-                        if !text.is_empty() {
-                            if thought_flag(part) {
-                                out.push(Ev::Thought(text.to_string()));
-                            } else {
-                                out.push(Ev::Text(text.to_string()));
-                            }
-                            continue;
-                        }
-                    }
-                    if part
-                        .get("functionCall")
-                        .and_then(|fc| fc.get("name"))
-                        .and_then(Value::as_str)
-                        .is_some_and(|n| !n.is_empty())
-                    {
-                        tracing::debug!("dropped functionCall part (no tool support)");
-                        continue;
-                    }
-                    if let Some(inline) = part.get("inlineData") {
-                        if let (Some(mime), Some(data)) = (
-                            inline.get("mimeType").and_then(Value::as_str),
-                            inline.get("data").and_then(Value::as_str),
-                        ) {
-                            if !mime.is_empty() && !data.is_empty() {
-                                out.push(Ev::Image {
-                                    mime: mime.to_string(),
-                                    b64: data.to_string(),
-                                });
+            if let Some(content) = cand.get_mut("content").and_then(Value::as_object_mut) {
+                if let Some(Value::Array(parts)) = content.get_mut("parts") {
+                    for part in parts.iter_mut() {
+                        // batchGraphql parts are proto3-style: EVERY field is
+                        // present with an empty value (functionCall.name="",
+                        // inlineData:{mimeType:"",data:""}, executableCode with
+                        // enum-default strings, ...). Text extraction runs FIRST
+                        // so shell fields can never swallow real content;
+                        // tool/code/image fields only count when they carry
+                        // actual content (live-tested 2026-08-30).
+                        if let Some(Value::String(text)) = part.get_mut("text").map(Value::take) {
+                            if !text.is_empty() {
+                                if thought_flag(part) {
+                                    out.push(Ev::Thought(text));
+                                } else {
+                                    out.push(Ev::Text(text));
+                                }
                                 continue;
                             }
+                            // Empty shell text falls through to the field checks.
                         }
-                    }
-                    if shell_part_nonempty(part, "executableCode")
-                        || shell_part_nonempty(part, "codeExecutionResult")
-                    {
-                        tracing::debug!("dropped code-execution part (no tool support)");
+                        if part
+                            .get("functionCall")
+                            .and_then(|fc| fc.get("name"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|n| !n.is_empty())
+                        {
+                            tracing::debug!("dropped functionCall part (no tool support)");
+                            continue;
+                        }
+                        let (mime, data) =
+                            match part.get_mut("inlineData").and_then(Value::as_object_mut) {
+                                Some(inline) => {
+                                    let mime = match inline.remove("mimeType") {
+                                        Some(Value::String(m)) if !m.is_empty() => Some(m),
+                                        _ => None,
+                                    };
+                                    let data = match inline.remove("data") {
+                                        Some(Value::String(d)) if !d.is_empty() => Some(d),
+                                        _ => None,
+                                    };
+                                    (mime, data)
+                                }
+                                None => (None, None),
+                            };
+                        if let (Some(mime), Some(data)) = (mime, data) {
+                            out.push(Ev::Image { mime, b64: data });
+                            continue;
+                        }
+                        if shell_part_nonempty(part, "executableCode")
+                            || shell_part_nonempty(part, "codeExecutionResult")
+                        {
+                            tracing::debug!("dropped code-execution part (no tool support)");
+                        }
                     }
                 }
             }
-            if let Some(finish) = cand.get("finishReason").and_then(Value::as_str) {
-                if !finish.is_empty() && !ends_with_unspecified(finish) {
-                    out.push(Ev::Finish(finish.to_string()));
+            if let Some(Value::String(finish)) = cand.get_mut("finishReason").map(Value::take) {
+                if !finish.is_empty() && !ends_with_unspecified(&finish) {
+                    out.push(Ev::Finish(finish));
                 }
             }
         }
     }
 
-    if let Some(usage) = chunk.get("usageMetadata") {
-        if usage.is_object() && !usage.as_object().unwrap().is_empty() {
-            out.push(Ev::Usage(usage.clone()));
+    // usageMetadata: move the whole object out when it is a non-empty map.
+    if let Some(Value::Object(map)) = chunk.get_mut("usageMetadata").map(Value::take) {
+        if !map.is_empty() {
+            out.push(Ev::Usage(Value::Object(map)));
         }
     }
 }
@@ -477,7 +494,7 @@ mod tests {
 
     #[test]
     fn text_thought_and_finish_extracted() {
-        let chunk = json!({
+        let mut chunk = json!({
             "candidates": [{
                 "content": { "role": "model", "parts": [
                     { "text": "thinking out loud", "thought": true },
@@ -488,7 +505,7 @@ mod tests {
             "usageMetadata": { "promptTokenCount": 1, "candidatesTokenCount": 2, "totalTokenCount": 3 }
         });
         let mut out = Vec::new();
-        extract_from_chunk(&chunk, &mut out);
+        extract_from_chunk(&mut chunk, &mut out);
         assert!(matches!(&out[0], Ev::Thought(t) if t == "thinking out loud"));
         assert!(matches!(&out[1], Ev::Text(t) if t == "answer"));
         assert!(matches!(&out[2], Ev::Finish(f) if f == "STOP"));
@@ -497,19 +514,19 @@ mod tests {
 
     #[test]
     fn unspecified_defaults_are_filtered() {
-        let chunk = json!({
+        let mut chunk = json!({
             "candidates": [{ "content": {"parts": [{"text": "x"}]}, "finishReason": "FINISH_REASON_UNSPECIFIED" }],
             "promptFeedback": { "blockReason": "BLOCK_REASON_UNSPECIFIED" }
         });
         let mut out = Vec::new();
-        extract_from_chunk(&chunk, &mut out);
+        extract_from_chunk(&mut chunk, &mut out);
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], Ev::Text(_)));
     }
 
     #[test]
     fn thought_string_false_is_falsy_but_true_strings_accepted() {
-        let chunk = json!({
+        let mut chunk = json!({
             "candidates": [{ "content": { "parts": [
                 { "text": "a", "thought": "true" },
                 { "text": "b", "thought": "True" },
@@ -517,7 +534,7 @@ mod tests {
             ]}}]
         });
         let mut out = Vec::new();
-        extract_from_chunk(&chunk, &mut out);
+        extract_from_chunk(&mut chunk, &mut out);
         assert!(matches!(&out[0], Ev::Thought(_)));
         assert!(matches!(&out[1], Ev::Thought(_)));
         assert!(matches!(&out[2], Ev::Text(_)));
@@ -525,7 +542,7 @@ mod tests {
 
     #[test]
     fn function_call_and_code_parts_dropped() {
-        let chunk = json!({
+        let mut chunk = json!({
             "candidates": [{ "content": { "parts": [
                 { "functionCall": { "name": "f", "args": {} } },
                 { "executableCode": { "code": "x" } },
@@ -533,7 +550,7 @@ mod tests {
             ]}}]
         });
         let mut out = Vec::new();
-        extract_from_chunk(&chunk, &mut out);
+        extract_from_chunk(&mut chunk, &mut out);
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], Ev::Text(t) if t == "keep"));
     }
@@ -542,7 +559,7 @@ mod tests {
     fn batchgraphql_proto3_shells_do_not_swallow_text() {
         // Live shape (2026-08-30): every field present with an empty value.
         // Text parts must survive; empty shells must not become drops/images.
-        let chunk = json!({
+        let mut chunk = json!({
             "candidates": [{ "content": { "role": "model", "parts": [
                 {
                     "data": "text", "text": "PONG", "thought": false,
@@ -564,7 +581,7 @@ mod tests {
             "promptFeedback": {}
         });
         let mut out = Vec::new();
-        extract_from_chunk(&chunk, &mut out);
+        extract_from_chunk(&mut chunk, &mut out);
         assert_eq!(
             out.len(),
             2,
@@ -576,23 +593,23 @@ mod tests {
 
     #[test]
     fn blocked_with_message() {
-        let chunk = json!({
+        let mut chunk = json!({
             "promptFeedback": { "blockReason": "SAFETY", "blockReasonMessage": "blocked" }
         });
         let mut out = Vec::new();
-        extract_from_chunk(&chunk, &mut out);
+        extract_from_chunk(&mut chunk, &mut out);
         assert!(matches!(&out[0], Ev::Blocked(m) if m.contains("SAFETY") && m.contains("blocked")));
     }
 
     #[test]
     fn image_part_extracted() {
-        let chunk = json!({
+        let mut chunk = json!({
             "candidates": [{ "content": { "parts": [
                 { "inlineData": { "mimeType": "image/png", "data": "AAA" } }
             ]}}]
         });
         let mut out = Vec::new();
-        extract_from_chunk(&chunk, &mut out);
+        extract_from_chunk(&mut chunk, &mut out);
         assert!(matches!(&out[0], Ev::Image { mime, b64 } if mime == "image/png" && b64 == "AAA"));
     }
 }
