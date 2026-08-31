@@ -18,6 +18,7 @@ mod modelcaps;
 mod oai;
 mod pipeline;
 mod prefill;
+mod proxybridge;
 mod retry;
 mod rewrite;
 mod sapisid;
@@ -69,6 +70,7 @@ async fn main() {
         express = cfg.express_enabled(),
         cookie = cfg.cookie_enabled(),
         proxy = cfg.socks5.is_some(),
+        transit = cfg.socks5_transit.is_some(),
         "config loaded"
     );
 

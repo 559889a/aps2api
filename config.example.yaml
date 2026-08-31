@@ -12,6 +12,12 @@ port: 8080                          # listen port (must be > 1024 on Android/Ter
 #                                          # (phone/Termux included — no extra VPN or chaining tools needed).
 #                                          # Plain "socks5://127.0.0.1:7890" (local chaining entry) and
 #                                          # socks5h:// are also accepted. Applies to both channels.
+# socks5_transit: "socks5://127.0.0.1:7890"  # optional chained egress: the first hop through the local
+#                                            # proxy client (clash/FlClash mixed or socks port), while
+#                                            # `socks5` stays the remote exit. aps2api dials the exit
+#                                            # THROUGH the local client via an in-process loopback bridge:
+#                                            # loopback never enters a TUN-mode VPN, so the chain works
+#                                            # even while the VPN is on. Requires `socks5` to be set.
 
 # ============ Express channel (Vertex Express API key) ============
 express:

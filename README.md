@@ -55,7 +55,10 @@ the response back in the client's protocol.
   rolling is retried once on the refreshed jar automatically. Opt out with
   `cookie.auto_refresh: false`.
 - **Local API key auth** and a global **authenticated SOCKS5 proxy** option
-  (`socks5://user:pass@host:port`) that applies to every upstream connection.
+  (`socks5://user:pass@host:port`) that applies to every upstream connection —
+  plus an optional **chained egress** (`socks5_transit`): an in-process loopback
+  SOCKS5 bridge forwards transit → remote exit, so the fixed-IP egress keeps
+  working even while the device's VPN/TUN is on.
 
 ## Quick Start
 
@@ -80,6 +83,10 @@ Direct authenticated proxy, or a local chaining entry — both are plain SOCKS5 
 socks5: "socks5://user:pass@residential-host:port"
 # ...or a local proxy client's mixed/socks port
 # socks5: "socks5://127.0.0.1:7890"
+
+# Chained egress (optional): first hop through the local proxy client while
+# the remote exit stays the egress. Works even under TUN mode — see below.
+# socks5_transit: "socks5://127.0.0.1:7890"
 ```
 
 Comment the line out for a direct connection (a first-class mode: works out of the box
@@ -93,11 +100,18 @@ error, even though the exact same config works the moment TUN is off. Loopback
 entries are exempt (traffic to 127.0.0.1 does not enter the TUN), which is why the
 local chaining form below keeps working under TUN. Fixes, in order of preference:
 
-1. Keep `socks5: "socks5://127.0.0.1:7897"` (local chaining) and let the proxy client
-   forward to the remote node — the loopback hop is invisible to TUN.
-2. Or add a DIRECT routing rule for the remote entry's IP in your proxy client, so
+1. Set `socks5_transit: "socks5://127.0.0.1:7890"` (your proxy client's local
+   mixed/socks port) alongside `socks5` (the remote exit). aps2api then dials the
+   exit **through** the local proxy client via an in-process loopback SOCKS5
+   bridge — the loopback hop is invisible to TUN, the remote exit still does the
+   username/password auth, and DNS still resolves at the exit. This is the
+   recommended form: it needs no proxy-client routing rules and works on the
+   phone (FlClash/always-on VPN) exactly like on the desktop.
+2. Keep `socks5: "socks5://127.0.0.1:7897"` (local chaining) and configure the
+   proxy client itself to forward to the remote node.
+3. Or add a DIRECT routing rule for the remote entry's IP in your proxy client, so
    connections to the entry bypass the TUN.
-3. Or turn TUN off for this machine.
+4. Or turn TUN off for this machine.
 
 At boot the server probes the configured entry with a full SOCKS5 handshake
 (method negotiation, username/password auth, one CONNECT through the exit to a
@@ -134,6 +148,15 @@ On a phone you do not need any VPN app: put an authenticated SOCKS5 URL into the
 `socks5:` field (e.g. `socks5://user:pass@your-home-exit:port`) and all upstream traffic
 leaves from that static residential IP as long as the phone can reach the proxy entry.
 
+If the phone runs an always-on VPN client (FlClash etc.) that the residential entry
+cannot be reached through directly, add one line — the VPN client's local port as the
+transit — and aps2api chains internally: loopback bridge → VPN client → your exit:
+
+```yaml
+socks5: "socks5://user:pass@your-home-exit:port"
+socks5_transit: "socks5://127.0.0.1:7890"   # the VPN client's local mixed/socks port
+```
+
 ## Configuration
 
 All settings live in `config.yaml` next to the binary; see the heavily commented
@@ -143,6 +166,7 @@ All settings live in `config.yaml` next to the binary; see the heavily commented
 |-------|---------|
 | `api_key` / `port` | local auth key and listen port (required) |
 | `socks5` | global outbound SOCKS5 proxy (commented out = direct); supports `user:pass@` and `socks5h://` |
+| `socks5_transit` | chained egress first hop (local proxy client port, e.g. `socks5://127.0.0.1:7890`); requires `socks5` — traffic then goes transit → remote exit through the in-process loopback bridge, immune to TUN/VPN takeover |
 | `express.api_key` / `express.project_id` / `express.location` | Express channel credentials; keep `location: global` |
 | `cookie.cookie` / `cookie.project_id` / `cookie.experiment_flags` | cookie channel credentials |
 | `cookie.auto_refresh` | cookie auto-refresh (default `true`): harvest `Set-Cookie` rewrites into a jar persisted to `cookie.jar.yaml`; `false` freezes the startup string |
@@ -242,6 +266,7 @@ aps2api/
     │   └── emit.rs                  # events -> OAI SSE chunks / chat.completion JSON (§9.4)
     ├── pipeline.rs                  # shared retry loop: emitted guard, budget, disconnect (§12)
     ├── prefill.rs                   # prefill engine: nudge, CoT guard, deduper (§11)
+    ├── proxybridge.rs               # chained-egress loopback SOCKS5 bridge: transit -> remote exit (§2.2)
     ├── rewrite.rs                   # outbound payload rewrite matrix + safety injection (§8)
     ├── retry.rs                     # backoff/fixed waits + SSE keep-alive heartbeats (§12.4)
     ├── sapisid.rs                   # cookie parsing, validation, SAPISIDHASH x3 (§7.1)

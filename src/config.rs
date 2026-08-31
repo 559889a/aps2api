@@ -21,6 +21,14 @@ pub struct Config {
     /// Commented out / absent = direct connection (a first-class mode).
     #[serde(default)]
     pub socks5: Option<String>,
+    /// First hop of the chained egress (spec §2.2): a local SOCKS5 port,
+    /// e.g. the VPN client's `127.0.0.1:7890`. With this set, outbound
+    /// traffic goes transit → `socks5` (the authenticated remote exit) via
+    /// the in-process loopback bridge — loopback never enters a TUN-mode
+    /// VPN, so the egress chain survives the device's VPN being on.
+    /// Requires `socks5` to be set.
+    #[serde(default)]
+    pub socks5_transit: Option<String>,
     #[serde(default)]
     pub express: ExpressConfig,
     #[serde(default)]
@@ -148,6 +156,21 @@ impl Config {
             if !(lower.starts_with("socks5://") || lower.starts_with("socks5h://")) {
                 return Err(format!(
                     "`socks5` must start with socks5:// or socks5h:// (got {url:?})"
+                ));
+            }
+        }
+        if let Some(url) = &self.socks5_transit {
+            if self.socks5.is_none() {
+                return Err(
+                    "`socks5_transit` requires `socks5`: the transit is the first hop, `socks5` \
+                     is the egress the chain ends at"
+                        .to_string(),
+                );
+            }
+            let lower = url.to_lowercase();
+            if !(lower.starts_with("socks5://") || lower.starts_with("socks5h://")) {
+                return Err(format!(
+                    "`socks5_transit` must start with socks5:// or socks5h:// (got {url:?})"
                 ));
             }
         }

@@ -296,6 +296,7 @@ mod dispatch_tests {
             api_key: "k".into(),
             port: 8080,
             socks5: None,
+            socks5_transit: None,
             express: crate::config::ExpressConfig {
                 api_key: "AQ.test-key".into(),
                 project_id: "p".into(),
