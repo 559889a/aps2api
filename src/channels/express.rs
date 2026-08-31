@@ -85,7 +85,9 @@ impl ExpressClient {
         if stream {
             tokio::spawn(crate::channels::pump_sse(resp.bytes_stream(), tx));
         } else {
-            tokio::spawn(crate::channels::pump_single(resp.bytes(), tx));
+            // Streaming accumulation with the 64MB cap inside pump_single:
+            // an unbounded whole-body read is a memory red line.
+            tokio::spawn(crate::channels::pump_single(resp.bytes_stream(), tx));
         }
         Ok(EvStream::new(rx))
     }

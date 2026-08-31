@@ -12,6 +12,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde_json::Value;
 
 const MAX_REDIRECTS: usize = 3;
@@ -129,12 +130,17 @@ pub async fn fetch_remote_image(
                 return Err(deny("image exceeds the 20MB limit"));
             }
         }
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| deny(&format!("body read failed: {e}")))?;
-        if body.len() > MAX_IMAGE_BYTES {
-            return Err(deny("image exceeds the 20MB limit"));
+        // Read the body STREAMING and stop at the cap: a content-length
+        // precheck only stops honest servers — a lying/omitting source must
+        // be caught on the read side (memory red line, 2026-08-31).
+        let mut body: Vec<u8> = Vec::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| deny(&format!("body read failed: {e}")))?;
+            body.extend_from_slice(&chunk);
+            if body.len() > MAX_IMAGE_BYTES {
+                return Err(deny("image exceeds the 20MB limit"));
+            }
         }
         let b64 = use_base64(&body);
         return Ok((mime, b64));

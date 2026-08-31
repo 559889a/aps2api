@@ -65,15 +65,7 @@ fn ends_with_unspecified(s: &str) -> bool {
 
 async fn emit_json(tx: &mpsc::Sender<Ev>, data: &str) {
     match serde_json::from_str::<Value>(data) {
-        Ok(mut chunk) => {
-            let mut events = Vec::new();
-            extract_from_chunk(&mut chunk, &mut events);
-            for ev in events {
-                if tx.send(ev).await.is_err() {
-                    return;
-                }
-            }
-        }
+        Ok(chunk) => emit_chunk(tx, chunk).await,
         Err(e) => {
             let _ = tx
                 .send(Ev::Error(errs::classify_error(
@@ -81,6 +73,17 @@ async fn emit_json(tx: &mpsc::Sender<Ev>, data: &str) {
                     format!("upstream returned invalid JSON: {e}"),
                 )))
                 .await;
+        }
+    }
+}
+
+/// Extraction over one parsed upstream chunk (both pumps converge here).
+async fn emit_chunk(tx: &mpsc::Sender<Ev>, mut chunk: Value) {
+    let mut events = Vec::new();
+    extract_from_chunk(&mut chunk, &mut events);
+    for ev in events {
+        if tx.send(ev).await.is_err() {
+            return;
         }
     }
 }
@@ -237,19 +240,64 @@ where
     scanner.finish();
 }
 
-/// Single-JSON pump: the whole body is one GenerateContentResponse.
-pub(crate) async fn pump_single<Fut, B, E>(read_all: Fut, tx: mpsc::Sender<Ev>)
+/// Single-JSON pump: the whole body is one GenerateContentResponse. The body
+/// is accumulated STREAMING with the same 64MB cap as the SSE line buffer —
+/// `resp.bytes()` (unbounded whole-body read) would let a runaway upstream
+/// allocate without limit (2026-08-31 GC hardening); crossing the cap fails
+/// the attempt as non-retryable Invalid.
+pub(crate) async fn pump_single<S, E>(stream: S, tx: mpsc::Sender<Ev>)
 where
-    Fut: std::future::Future<Output = Result<B, E>>,
-    B: AsRef<[u8]>,
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
 {
-    match read_all.await {
-        Ok(bytes) => emit_json(&tx, &String::from_utf8_lossy(bytes.as_ref())).await,
+    pump_single_with_limit(stream, tx, MAX_SSE_LINE).await
+}
+
+pub(crate) async fn pump_single_with_limit<S, E>(
+    mut stream: S,
+    tx: mpsc::Sender<Ev>,
+    max_bytes: usize,
+) where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match stream.next().await {
+            Some(Ok(bytes)) => {
+                buf.extend_from_slice(&bytes);
+                if buf.len() > max_bytes {
+                    let _ = tx
+                        .send(Ev::Error(UpstreamError {
+                            kind: ErrorKind::Invalid,
+                            status: None,
+                            message: format!(
+                                "upstream response body exceeded the buffer limit \
+                                 ({max_bytes} bytes)"
+                            ),
+                        }))
+                        .await;
+                    return;
+                }
+            }
+            Some(Err(e)) => {
+                let _ = tx
+                    .send(transport_err(format!(
+                        "failed to read upstream response: {e}"
+                    )))
+                    .await;
+                return;
+            }
+            None => break,
+        }
+    }
+    match serde_json::from_slice::<Value>(&buf) {
+        Ok(chunk) => emit_chunk(tx, chunk).await,
         Err(e) => {
             let _ = tx
-                .send(transport_err(format!(
-                    "failed to read upstream response: {e}"
+                .send(Ev::Error(errs::classify_error(
+                    None,
+                    format!("upstream returned invalid JSON: {e}"),
                 )))
                 .await;
         }
@@ -414,6 +462,50 @@ mod tests {
             Some(Ev::Error(e)) => {
                 assert_eq!(e.kind, ErrorKind::Invalid, "floods must not be retryable");
             }
+            other => panic!("expected error event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn single_json_pump_parses_and_respects_the_cap() {
+        // Split across chunks: streaming accumulation must reassemble and
+        // parse the complete single-JSON body.
+        let body = r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}"#;
+        let (tx, mut rx) = mpsc::channel::<Ev>(8);
+        let stream = futures_util::stream::iter(vec![
+            Ok::<Bytes, std::convert::Infallible>(Bytes::copy_from_slice(&body[..10])),
+            Ok::<Bytes, std::convert::Infallible>(Bytes::copy_from_slice(&body[10..])),
+        ]);
+        pump_single(stream, tx).await;
+        assert!(matches!(rx.recv().await, Some(Ev::Text(t)) if t == "hi"));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn single_json_pump_over_the_cap_fails_without_retry() {
+        let (tx, mut rx) = mpsc::channel::<Ev>(8);
+        let stream = futures_util::stream::iter(vec![
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"{\"pad\":\"")),
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from("x".repeat(32))),
+        ]);
+        pump_single_with_limit(stream, tx, 16).await;
+        match rx.recv().await {
+            Some(Ev::Error(e)) => {
+                assert_eq!(e.kind, ErrorKind::Invalid, "floods must not be retryable");
+            }
+            other => panic!("expected error event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn single_json_pump_invalid_json_is_classified() {
+        let (tx, mut rx) = mpsc::channel::<Ev>(8);
+        let stream = futures_util::stream::iter(vec![Ok::<Bytes, std::convert::Infallible>(
+            Bytes::from_static(b"not json at all"),
+        )]);
+        pump_single(stream, tx).await;
+        match rx.recv().await {
+            Some(Ev::Error(_)) => {}
             other => panic!("expected error event, got {other:?}"),
         }
     }

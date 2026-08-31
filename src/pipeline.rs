@@ -20,6 +20,11 @@ use crate::config::Config;
 use crate::ir::{ApiError, Channel, ErrorKind, Ev, UpstreamError};
 use crate::retry;
 
+/// Total byte cap on the events aggregated by one bypass run (text + image
+/// base64 payload sizes). A runaway upstream must not grow the aggregation
+/// without bound (same class of guard as the 64MB pump buffers).
+const MAX_BYPASS_EVENTS_BYTES: usize = 64 * 1024 * 1024;
+
 /// What the port layer plugs into the pipeline. Streaming methods produce
 /// wire bytes; the aggregation methods build the non-streaming result.
 pub trait PortEmitter: Send {
@@ -739,12 +744,27 @@ pub async fn run_bypass(
             // Phase 2: collect the complete upstream response, heartbeating
             // through every silent stretch. The budget bounds only the wait
             // for the FIRST event (a non-stream upstream emits everything at
-            // once at the end); afterwards the cadence runs unbounded.
+            // once at the end); afterwards the cadence runs unbounded. The
+            // accumulated events are capped in total size (64MB): a runaway
+            // upstream emitting endless events must not grow this Vec without
+            // bound (memory red line; Invalid = no retry, the flood would
+            // just repeat).
             let mut events: Vec<Ev> = Vec::new();
+            let mut events_bytes: usize = 0;
+            let mut flooded = false;
             let outcome = loop {
                 match tokio::time::timeout(retry::HEARTBEAT_EVERY, stream.next()).await {
                     Ok(Some(Ev::Error(e))) => break Err(e),
                     Ok(Some(ev)) => {
+                        events_bytes += match &ev {
+                            Ev::Text(t) | Ev::Thought(t) => t.len(),
+                            Ev::Image { b64, .. } => b64.len(),
+                            _ => 0,
+                        };
+                        if events_bytes > MAX_BYPASS_EVENTS_BYTES {
+                            flooded = true;
+                            break Ok(());
+                        }
                         events.push(ev);
                         waited = std::time::Duration::ZERO;
                     }
@@ -773,6 +793,24 @@ pub async fn run_bypass(
                     }
                 }
             };
+
+            if flooded {
+                let e = UpstreamError {
+                    kind: ErrorKind::Invalid,
+                    status: None,
+                    message: format!(
+                        "bypass aggregated events exceeded the buffer limit \
+                         ({MAX_BYPASS_EVENTS_BYTES} bytes)"
+                    ),
+                };
+                log_give_up(Channel::Express, &model, attempt, cfg.retry.max, false, &e);
+                for b in em.on_error(&e) {
+                    if tx.send(Ok(b)).await.is_err() {
+                        return;
+                    }
+                }
+                return;
+            }
 
             let e = match outcome {
                 Ok(()) => match events.iter().find_map(|ev| match ev {
