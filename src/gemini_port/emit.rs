@@ -251,7 +251,7 @@ impl GeminiEmitter {
                 .filter(|p| p.get("thought").is_none())
                 .filter_map(|p| p.get("text").and_then(Value::as_str))
                 .collect();
-            let stitched = strip_overlap(&self.prefill, &body);
+            let mut stitched = strip_overlap(&self.prefill, &body);
             self.saw_content = true;
             let last_body = parts
                 .iter()

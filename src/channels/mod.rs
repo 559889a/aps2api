@@ -189,7 +189,7 @@ pub(crate) async fn pump_concat<S, E, F>(mut stream: S, tx: mpsc::Sender<Ev>, mu
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
     E: std::fmt::Display,
-    F: FnMut(&Value, &mut Vec<Ev>),
+    F: FnMut(&mut Value, &mut Vec<Ev>),
 {
     let mut scanner = crate::streamscan::JsonStreamScanner::new();
     loop {
@@ -295,7 +295,7 @@ pub(crate) async fn pump_single_with_limit<S, E>(
         }
     }
     match serde_json::from_slice::<Value>(&buf) {
-        Ok(chunk) => emit_chunk(tx, chunk).await,
+        Ok(chunk) => emit_chunk(&tx, chunk).await,
         Err(e) => {
             let _ = tx
                 .send(Ev::Error(errs::classify_error(

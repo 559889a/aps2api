@@ -157,7 +157,8 @@ async fn probe_read_exact(
     tokio::time::timeout(step, stream.read_exact(buf))
         .await
         .map_err(|_| "SOCKS5 probe read timed out".to_string())?
-        .map_err(|e| format!("SOCKS5 probe read failed: {e}"))
+        .map_err(|e| format!("SOCKS5 probe read failed: {e}"))?;
+    Ok(())
 }
 
 /// Percent-decode a URL userinfo part (username/password); undecodable input
