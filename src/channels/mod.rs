@@ -515,10 +515,11 @@ mod tests {
         // Split across chunks: streaming accumulation must reassemble and
         // parse the complete single-JSON body.
         let body = r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}"#;
+        let bytes = body.as_bytes();
         let (tx, mut rx) = mpsc::channel::<Ev>(8);
         let stream = futures_util::stream::iter(vec![
-            Ok::<Bytes, std::convert::Infallible>(Bytes::copy_from_slice(&body[..10])),
-            Ok::<Bytes, std::convert::Infallible>(Bytes::copy_from_slice(&body[10..])),
+            Ok::<Bytes, std::convert::Infallible>(Bytes::copy_from_slice(&bytes[..10])),
+            Ok::<Bytes, std::convert::Infallible>(Bytes::copy_from_slice(&bytes[10..])),
         ]);
         pump_single(stream, tx).await;
         assert!(matches!(rx.recv().await, Some(Ev::Text(t)) if t == "hi"));
