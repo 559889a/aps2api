@@ -95,10 +95,16 @@ pub fn classify_error(status: Option<u16>, message: impl Into<String>) -> Upstre
 pub fn user_hint(kind: ErrorKind) -> &'static str {
     match kind {
         ErrorKind::Auth => {
-            "\n\n💡 Cookie 通常较为持久（只要不退出登录/改密码/被 Google 主动失效，可维持数周甚至更久）；\
-自动续期已尝试刷新仍失败，说明登录态整体失效（非短期凭据滚动）。重新获取：电脑浏览器打开 \
-console.cloud.google.com，F12 → Network，复制任意请求的 Cookie 头，更新 config.yaml 的 \
-cookie 字段后重启。"
+            // Channel-neutral (2026-08-31 fix): both channels classify here —
+            // an express 401 is a bad express.api_key and must not send the
+            // user re-copying cookies. Check the key first, then the cookie
+            // guidance.
+            "\n\n💡 认证失败排查：① 走 express 通道时，请检查 config.yaml 中 \
+express.api_key 是否有效（新式 AQ.* 密钥，填错或失效都会 401/403）；\
+② 走 cookie 通道时，说明登录态整体失效——Cookie 通常较为持久（只要不退出登录/改密码/\
+被 Google 主动失效，可维持数周甚至更久），自动续期已尝试刷新仍失败，即非短期凭据滚动。\
+重新获取：电脑浏览器打开 console.cloud.google.com，F12 → Network，复制任意请求的 \
+Cookie 头，更新 config.yaml 的 cookie 字段后重启。"
         }
         ErrorKind::Project => {
             "\n\n这看起来是**项目层面**的问题，不是 Cookie 失效，重取 Cookie 无用。请依次检查：\
