@@ -99,11 +99,18 @@ local chaining form below keeps working under TUN. Fixes, in order of preference
    connections to the entry bypass the TUN.
 3. Or turn TUN off for this machine.
 
-At boot the server probes the configured entry with one raw TCP connect and logs a
-`WARN socks5 proxy entry is NOT reachable` line (with the same checklist) when it
-cannot reach it — check the first seconds of the log before debugging anything else.
-The probe is advisory only: it never blocks startup, and an entry that whitelists
-your deployment machine's IP may still be flagged on other machines.
+At boot the server probes the configured entry with a full SOCKS5 handshake
+(method negotiation, username/password auth, one CONNECT through the exit to a
+neutral address — a bare TCP open, no application data) and logs a
+`WARN socks5 proxy entry failed the handshake probe` line when any stage fails.
+The error text names the failing stage, which maps onto the checklist: "TCP
+connects but the peer is not a SOCKS5 server" means the connection is being
+intercepted or misrouted (TUN / wrong port); "username/password rejected" means
+the credentials in the url; "CONNECT through the exit failed" means the entry is
+up but the exit node is dead. Check the first seconds of the log before
+debugging anything else. The probe is advisory only: it never blocks startup,
+and an entry that whitelists your deployment machine's IP may still be flagged
+on other machines.
 
 ### Termux (Android)
 

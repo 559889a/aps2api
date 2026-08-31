@@ -37,13 +37,20 @@ pub fn proxied_url(url: &str) -> String {
     url.to_string()
 }
 
-/// Startup TCP liveness probe for the configured socks5 entry (spec §2.2).
-/// A raw TCP connect, no SOCKS bytes: it verifies reachability of the entry,
-/// not authentication. Failure does NOT block startup — the probe is
-/// best-effort (an entry may whitelist specific source IPs and still work
-/// from the deployment machine) — but a failure turns the "every upstream
-/// request dies as transport error" mystery into a one-line WARN at boot.
+/// Startup SOCKS5 liveness probe for the configured entry (spec §2.2): a FULL
+/// handshake — method negotiation, username/password auth when the URL has
+/// credentials, and one CONNECT through the exit to a neutral address (a bare
+/// TCP open, no application data) — not just a TCP connect. A raw connect
+/// cannot tell the real failure modes apart: under a TUN-mode proxy client the
+/// TCP connection to a public entry is intercepted and may complete while the
+/// SOCKS5 layer never speaks; a misrouted or non-SOCKS5 listener answers the
+/// greeting with garbage; rejected credentials surface only at the auth step;
+/// a dead exit node only at CONNECT. Failure does NOT block startup — the
+/// probe is advisory (an entry may whitelist specific source IPs) — but the
+/// failure reason tells the operator which fix applies.
 pub async fn probe_socks5(url: &str) -> Result<(), String> {
+    const STEP: Duration = Duration::from_secs(5);
+
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid proxy url: {e}"))?;
     let host = parsed
         .host_str()
@@ -53,16 +60,113 @@ pub async fn probe_socks5(url: &str) -> Result<(), String> {
         .port_or_known_default()
         .ok_or_else(|| "proxy url has no port".to_string())?;
     let addr = format!("{host}:{port}");
-    match tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::TcpStream::connect(&addr),
-    )
-    .await
-    {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(format!("{addr}: {e}")),
-        Err(_) => Err(format!("{addr}: connect timed out after 5s")),
+    let username = decode_url_part(parsed.username());
+    let password = decode_url_part(parsed.password().unwrap_or(""));
+
+    let mut stream = tokio::time::timeout(STEP, tokio::net::TcpStream::connect(&addr))
+        .await
+        .map_err(|_| format!("{addr}: connect timed out after 5s"))?
+        .map_err(|e| format!("{addr}: {e}"))?;
+
+    // Greeting: offer no-auth; add username/password auth when the URL has
+    // credentials.
+    let has_creds = !username.is_empty() || !password.is_empty();
+    let mut greeting = vec![0x05u8, 0x01, 0x00];
+    if has_creds {
+        greeting[1] = 0x02;
+        greeting.push(0x02);
     }
+    probe_write(&mut stream, &greeting, STEP).await?;
+    let mut reply = [0u8; 2];
+    probe_read_exact(&mut stream, &mut reply, STEP).await?;
+    if reply[0] != 0x05 {
+        return Err(format!(
+            "{addr}: TCP connects but the peer is not a SOCKS5 server (version byte {:#04x}) — \
+             likely intercepted or misrouted (TUN?)",
+            reply[0]
+        ));
+    }
+    match reply[1] {
+        0x00 => {} // no-auth accepted
+        0x02 => {
+            if !has_creds {
+                return Err(format!(
+                    "{addr}: SOCKS5 server requires username/password auth but the url has none"
+                ));
+            }
+            if username.len() > 255 || password.len() > 255 {
+                return Err(format!(
+                    "{addr}: proxy credentials exceed the SOCKS5 field limit"
+                ));
+            }
+            let mut auth = vec![0x01u8, username.len() as u8];
+            auth.extend_from_slice(username.as_bytes());
+            auth.push(password.len() as u8);
+            auth.extend_from_slice(password.as_bytes());
+            probe_write(&mut stream, &auth, STEP).await?;
+            let mut auth_reply = [0u8; 2];
+            probe_read_exact(&mut stream, &mut auth_reply, STEP).await?;
+            if auth_reply[1] != 0x00 {
+                return Err(format!(
+                    "{addr}: SOCKS5 username/password rejected (status {})",
+                    auth_reply[1]
+                ));
+            }
+        }
+        other => {
+            return Err(format!(
+                "{addr}: SOCKS5 server refused our auth methods (reply {other:#04x})"
+            ));
+        }
+    }
+
+    // CONNECT through the exit to a neutral address (1.1.1.1:443 — one TCP
+    // open, no data): proves the exit path works, not just the entry.
+    let request = [0x05u8, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0x00, 0x44];
+    probe_write(&mut stream, &request, STEP).await?;
+    let mut head = [0u8; 4];
+    probe_read_exact(&mut stream, &mut head, STEP).await?;
+    if head[1] != 0x00 {
+        return Err(format!(
+            "{addr}: SOCKS5 CONNECT through the exit failed (reply {:#04x}) — likely a dead \
+             or expired exit node",
+            head[1]
+        ));
+    }
+    Ok(())
+}
+
+async fn probe_write(
+    stream: &mut tokio::net::TcpStream,
+    buf: &[u8],
+    step: Duration,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    tokio::time::timeout(step, stream.write_all(buf))
+        .await
+        .map_err(|_| "SOCKS5 probe write timed out".to_string())?
+        .map_err(|e| format!("SOCKS5 probe write failed: {e}"))
+}
+
+async fn probe_read_exact(
+    stream: &mut tokio::net::TcpStream,
+    buf: &mut [u8],
+    step: Duration,
+) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+    tokio::time::timeout(step, stream.read_exact(buf))
+        .await
+        .map_err(|_| "SOCKS5 probe read timed out".to_string())?
+        .map_err(|e| format!("SOCKS5 probe read failed: {e}"))
+}
+
+/// Percent-decode a URL userinfo part (username/password); undecodable input
+/// passes through raw rather than failing the probe over an edge case.
+fn decode_url_part(raw: &str) -> String {
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
