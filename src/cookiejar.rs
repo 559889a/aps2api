@@ -76,11 +76,19 @@ pub fn parse_set_cookie(header: &str) -> Option<(String, Option<String>)> {
     if value.is_empty() {
         return Some((name.to_string(), None));
     }
-    // Deletion via a past Expires date.
-    let expired = header
+    // Deletion via a past Expires date. Google sends the Netscape hyphenated
+    // form ("Expires=Thu, 01-Jan-1970 00:00:00 GMT"); RFC 6265 spellings use
+    // spaces ("Thu, 01 Jan 1970"). Normalize the ATTRIBUTES segment (after
+    // the first ';' — never the value itself, which could contain the same
+    // text) by dropping '-' and spaces so both spellings collapse onto one
+    // needle (2026-08-31 fix: the space-only form never matched Google's).
+    let attrs_start = header.find(';').unwrap_or(header.len());
+    let normalized: String = header[attrs_start..]
         .to_ascii_lowercase()
-        .contains("expires=thu, 01 jan 1970");
-    if expired {
+        .chars()
+        .filter(|c| *c != '-' && *c != ' ')
+        .collect();
+    if normalized.contains("expires=thu,01jan1970") {
         return Some((name.to_string(), None));
     }
     Some((name.to_string(), Some(value.to_string())))
@@ -326,6 +334,21 @@ mod tests {
             };
         }
         assert!(jar.get("NID").is_none());
+        // Google's actual hyphenated spelling of the epoch delete.
+        assert!(matches!(
+            parse_set_cookie("NID=999; expires=Thu, 01-Jan-1970 00:00:00 GMT; path=/"),
+            Some((name, None)) if name == "NID"
+        ));
+        // A FUTURE hyphenated date must NOT delete.
+        assert!(matches!(
+            parse_set_cookie("NID=222; expires=Sat, 01-Jan-2028 00:00:00 GMT"),
+            Some((_, Some(v))) if v == "222"
+        ));
+        // The needle inside a cookie VALUE is not an attribute: not a delete.
+        assert!(matches!(
+            parse_set_cookie("K=expires=Thu, 01-Jan-1970 00:00:00 GMT; path=/"),
+            Some((_, Some(v))) if v.starts_with("expires=")
+        ));
         // Attribute-only garbage is ignored.
         assert!(parse_set_cookie("Path=/; Secure").is_none());
     }
