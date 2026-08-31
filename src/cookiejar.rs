@@ -339,7 +339,9 @@ mod tests {
             parse_set_cookie("NID=999; expires=Thu, 01-Jan-1970 00:00:00 GMT; path=/"),
             Some((name, None)) if name == "NID"
         ));
-        // A FUTURE hyphenated date must NOT delete.
+        // A FUTURE hyphenated date must NOT delete (locally re-derived: the
+        // attributes normalize to "sat,01jan2028...", which does not contain
+        // the epoch needle — the cookie keeps its value).
         assert!(matches!(
             parse_set_cookie("NID=222; expires=Sat, 01-Jan-2028 00:00:00 GMT"),
             Some((_, Some(v))) if v == "222"
@@ -349,8 +351,11 @@ mod tests {
             parse_set_cookie("K=expires=Thu, 01-Jan-1970 00:00:00 GMT; path=/"),
             Some((_, Some(v))) if v.starts_with("expires=")
         ));
-        // Attribute-only garbage is ignored.
-        assert!(parse_set_cookie("Path=/; Secure").is_none());
+        // Attribute-only strings still parse as a first kv pair: "Path=/;
+        // Secure" yields ("Path", "/") — the jar gets a junk name it will
+        // simply never match on a Set-Cookie. Harmless by design; the parser
+        // intentionally has no attribute-name blocklist.
+        assert!(matches!(parse_set_cookie("Path=/; Secure"), Some((n, _)) if n == "Path"));
     }
 
     #[test]

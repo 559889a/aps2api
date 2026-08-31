@@ -283,10 +283,10 @@ mod tests {
 
     #[tokio::test]
     async fn cumulative_cap_drops_excess_images_keeps_earlier_ones() {
-        // Two images, cumulative cap set between them: the first stays, the
-        // second is dropped with the limit warning — same semantics as a
-        // failed fetch (memory red line: per-image caps alone left the total
-        // unbounded).
+        // Three 10-byte images, cumulative cap 25: a and b fit (10 + 10 <= 25;
+        // c would push the total to 30) — c is dropped with the limit warning,
+        // a and b stay. Semantics identical to a failed fetch (memory red
+        // line: per-image caps alone left the total unbounded).
         let mut parts = vec![
             serde_json::json!({ "remoteFetch": "http://x/a.png" }),
             serde_json::json!({ "remoteFetch": "http://x/b.png" }),
@@ -303,6 +303,6 @@ mod tests {
         .await;
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["inlineData"]["data"], "a".repeat(10));
-        assert_eq!(parts[1]["inlineData"]["data"], "c".repeat(10));
+        assert_eq!(parts[1]["inlineData"]["data"], "b".repeat(10));
     }
 }
