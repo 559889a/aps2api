@@ -244,7 +244,7 @@ async fn handle_inner(
         // Bypass alias: stream to the client, non-stream to the upstream
         // (spec §9.5). Everything else takes the normal streaming path.
         let rx = if ir.bypass {
-            pipeline::run_bypass(&state.ctx, &ir, payload, em).await
+            pipeline::run_bypass(&state.ctx, &ir, payload, received_at, em).await
         } else {
             pipeline::run_stream(&state.ctx, channel, &ir, payload, received_at, em).await
         };

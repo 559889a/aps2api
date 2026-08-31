@@ -602,13 +602,16 @@ pub async fn run_nonstream(
 /// the normal streaming emitter in one burst (role chunk → content →
 /// finish → [DONE]). Heartbeats never count as emitted content (§12.3), so
 /// retryable upstream failures keep their full retry budget. Retry
-/// decisions are logged like every other path; there is deliberately NO
-/// TTFB log here — the upstream request is non-streaming, so there is no
-/// first token to time (owner request 2026-08-30).
+/// decisions are logged like every other path; there is no TTFB line (the
+/// upstream request is non-streaming, no first token exists) but a
+/// `bypass complete` INFO line closes the request with total time, prep_us
+/// and retries (owner request 2026-08-31: bypass previously had zero
+/// timing visibility — a long silent wait was indistinguishable from a hang).
 pub async fn run_bypass(
     ctx: &Ctx,
     ir: &crate::ir::Ir,
     payload: Value,
+    received_at: Instant,
     mut em: Box<dyn PortEmitter>,
 ) -> mpsc::Receiver<Result<Bytes, std::convert::Infallible>> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::convert::Infallible>>(64);
@@ -617,6 +620,9 @@ pub async fn run_bypass(
     // has already rejected every other routing.
     let client_owned = ctx.client(Channel::Express).cloned();
     let model = ir.model.clone();
+    // Gateway-own cost, same clock origin as the streaming pumps (includes
+    // body read + parse on both ports since 2026-08-31).
+    let prep_us = received_at.elapsed().as_micros() as u64;
     tokio::spawn(async move {
         let client = match client_owned {
             Ok(c) => c,
@@ -819,7 +825,17 @@ pub async fn run_bypass(
                 }) {
                     Some(e) => e,
                     None => {
-                        // Success: one-shot flush of the whole answer.
+                        // Success: one-shot flush of the whole answer. The
+                        // summary line is the only timing visibility bypass
+                        // has (no first token exists upstream-side).
+                        tracing::info!(
+                            channel = "express",
+                            model = %model,
+                            total_s = secs_f64(received_at.elapsed()),
+                            prep_us,
+                            retries = attempt,
+                            "bypass complete"
+                        );
                         for ev in &events {
                             for b in em.on_event(ev) {
                                 if tx.send(Ok(b)).await.is_err() {

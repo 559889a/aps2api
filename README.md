@@ -155,6 +155,7 @@ The server logs to stdout at `info` level by default (override with `RUST_LOG`, 
 | `upstream attempt failed; retrying` | WARN | a retry was scheduled: `retry`/`max` within the budget, `delay_secs` backoff, failure reason |
 | `upstream first response` | INFO | first token arrived: `ttfb_ms` (per attempt, reset on retry) and `prep_us` — the gateway's own pre-upstream cost (request received → dispatched), measured once on the first attempt |
 | `stream complete` | INFO | the stream ended normally: `total_s` wall clock, `gen_s` first-token→end window, `retries` consumed, and output size/speed — `tokens`/`tps` when the upstream reports usage (express), `tokens_est`/`tps_est` when it does not (cookie) |
+| `bypass complete` | INFO | a fake-streaming bypass request finished: `total_s` from request receipt to the completed upstream call, `prep_us`, `retries` (bypass has no first token to time, so there is no `upstream first response` line) |
 | `upstream failed (...); returning the error to the client` | ERROR | terminal failure and its class: non-retryable, content-already-emitted (never-retry guarantee), or retry budget exhausted |
 
 Notes:
@@ -163,15 +164,16 @@ Notes:
   per token, thinking text included) for channels whose upstream never returns usage
   metadata — the `_est` suffix marks them as estimates, and real usage always wins
   when present. They are deliberately not comparable to a client-side tokenizer count.
-- Fake-streaming bypass requests log neither `upstream first response` nor
-  `stream complete`: their upstream is a single non-streaming call, so there is no
-  first token to time.
+- Fake-streaming bypass requests log no `upstream first response` and no
+  `stream complete` (their upstream is a single non-streaming call with no first
+  token); they log `bypass complete` instead.
 - Non-streaming requests log `upstream first response` (the first aggregated event is
   the first token) but no summary line.
-- The `prep_us` clock starts at handler entry. On the Gemini-native port that includes
-  reading and JSON-parsing the request body; on the OpenAI endpoint the axum `Json`
-  extractor parses before the handler runs, so that parse cost is not included —
-  don't compare `prep_us` across the two ports.
+- The `prep_us` clock starts at handler entry and includes reading and JSON-parsing
+  the request body on **both** ports (the OpenAI endpoint reads its body inside the
+  handler for exactly this reason), so the readings are directly comparable across
+  the two ports. Text chats read in the hundreds-of-microseconds range; single-digit
+  milliseconds point at multi-MB base64 payloads.
 
 ## Project Structure
 

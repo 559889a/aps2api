@@ -60,15 +60,37 @@ fn model_entry(id: &str) -> Value {
     json!({ "id": id, "object": "model", "created": 0, "owned_by": "google" })
 }
 
-pub async fn chat_completions(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
-    // Gateway-own cost baseline. The Json extractor has already parsed the
-    // body before this line, so prep_us on the OAI port misses that parse
-    // (the Gemini port reads the body itself and does include it).
+pub async fn chat_completions(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+) -> Response {
+    // Gateway-own cost baseline. The body is read and parsed HERE (not by the
+    // axum Json extractor): extractor parsing happens before the handler, so
+    // the extractor-based clock missed multi-MB base64 bodies entirely and
+    // OAI prep_us readings were not comparable with the Gemini port's. Same
+    // 64MB cap, same parse point, same clock origin on both ports.
     let received_at = Instant::now();
+    let body = match read_json_body(req).await {
+        Ok(b) => b,
+        Err(e) => return oai_error(e),
+    };
     match handle_chat(&state, &body, received_at).await {
         Ok(resp) => resp,
         Err(e) => oai_error(e),
     }
+}
+
+async fn read_json_body(req: axum::extract::Request) -> Result<Value, ApiError> {
+    let bytes = axum::body::to_bytes(req.into_body(), 64 * 1024 * 1024)
+        .await
+        .map_err(|e| ApiError {
+            status: 400,
+            message: format!("failed to read request body: {e}"),
+        })?;
+    serde_json::from_slice(&bytes).map_err(|e| ApiError {
+        status: 400,
+        message: format!("invalid JSON body: {e}"),
+    })
 }
 
 fn oai_error(e: ApiError) -> Response {
@@ -160,7 +182,7 @@ async fn handle_chat(
         // Bypass alias: stream to the client, non-stream to the upstream
         // (spec §9.5). Everything else takes the normal streaming path.
         let rx = if ir.bypass {
-            pipeline::run_bypass(&state.ctx, &ir, payload, em).await
+            pipeline::run_bypass(&state.ctx, &ir, payload, received_at, em).await
         } else {
             pipeline::run_stream(&state.ctx, channel, &ir, payload, received_at, em).await
         };
