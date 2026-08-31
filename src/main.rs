@@ -77,6 +77,16 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // Advisory socks5 reachability probe (spec §2.2): runs concurrently so a
+    // slow/unreachable entry never delays the listener; failures surface as
+    // a boot-time WARN naming the three usual causes.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            state.probe_outbound().await;
+        });
+    }
+
     let protected = Router::new()
         .route("/v1/models", get(oai::list_models))
         .route("/v1/chat/completions", post(oai::chat_completions))

@@ -37,6 +37,34 @@ pub fn proxied_url(url: &str) -> String {
     url.to_string()
 }
 
+/// Startup TCP liveness probe for the configured socks5 entry (spec §2.2).
+/// A raw TCP connect, no SOCKS bytes: it verifies reachability of the entry,
+/// not authentication. Failure does NOT block startup — the probe is
+/// best-effort (an entry may whitelist specific source IPs and still work
+/// from the deployment machine) — but a failure turns the "every upstream
+/// request dies as transport error" mystery into a one-line WARN at boot.
+pub async fn probe_socks5(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid proxy url: {e}"))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "proxy url has no host".to_string())?
+        .to_string();
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "proxy url has no port".to_string())?;
+    let addr = format!("{host}:{port}");
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(format!("{addr}: {e}")),
+        Err(_) => Err(format!("{addr}: connect timed out after 5s")),
+    }
+}
+
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Explicit rustls TLS config for both reqwest clients (express + remote

@@ -62,4 +62,26 @@ impl AppState {
             ctx,
         })
     }
+
+    /// Best-effort reachability probe of the configured socks5 entry (spec
+    /// §2.2): a failure means EVERY upstream request will die as a transport
+    /// error, so say so loudly at boot instead of leaving it to be inferred
+    /// from per-request retry logs. Never blocks startup (spec: the probe is
+    /// advisory — entries may whitelist specific source IPs).
+    pub async fn probe_outbound(&self) {
+        if let Some(url) = &self.config.socks5 {
+            if let Err(detail) = httpx::probe_socks5(url).await {
+                tracing::warn!(
+                    proxy = %url,
+                    error = %detail,
+                    "socks5 proxy entry is NOT reachable; every upstream request will fail \
+                     until this is fixed. Checklist: 1) a TUN-mode proxy client (clash/mihomo) \
+                     intercepts TCP to the entry — add a direct rule for the entry IP or \
+                     point socks5 at a local chaining port instead; 2) the entry's firewall / \
+                     IP whitelist does not allow this machine's egress IP; 3) the node itself \
+                     expired (rotating/residential entries do)"
+                );
+            }
+        }
+    }
 }

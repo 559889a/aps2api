@@ -79,6 +79,26 @@ socks5: "socks5://user:pass@residential-host:port"
 Comment the line out for a direct connection (a first-class mode: works out of the box
 behind your own VPN/clash).
 
+**TUN-mode clash users, read this before blaming the proxy.** If you point `socks5:`
+at a remote proxy entry (e.g. your static residential exit) while a clash/mihomo TUN
+mode is active, the TUN stack captures the TCP connection **to that entry** — the
+connection never reaches the node, and every upstream request fails as a transport
+error, even though the exact same config works the moment TUN is off. Loopback
+entries are exempt (traffic to 127.0.0.1 does not enter the TUN), which is why the
+local chaining form below keeps working under TUN. Fixes, in order of preference:
+
+1. Keep `socks5: "socks5://127.0.0.1:7897"` (local chaining) and let the proxy client
+   forward to the remote node — the loopback hop is invisible to TUN.
+2. Or add a DIRECT routing rule for the remote entry's IP in your proxy client, so
+   connections to the entry bypass the TUN.
+3. Or turn TUN off for this machine.
+
+At boot the server probes the configured entry with one raw TCP connect and logs a
+`WARN socks5 proxy entry is NOT reachable` line (with the same checklist) when it
+cannot reach it — check the first seconds of the log before debugging anything else.
+The probe is advisory only: it never blocks startup, and an entry that whitelists
+your deployment machine's IP may still be flagged on other machines.
+
 ### Termux (Android)
 
 The Termux build is a native `aarch64-linux-android` binary (bionic libc — not a glibc
