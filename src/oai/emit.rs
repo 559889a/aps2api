@@ -139,7 +139,12 @@ impl OaiEmitter {
             }
             Ev::Usage(u) => self.usage = Some(map_usage(u)),
             Ev::Blocked(_) => {
-                // finalize as content_filter in on_stream_end
+                // No OAI wire shape exists for promptFeedback: remember it so
+                // on_stream_end finishes with content_filter and the
+                // empty-response diagnosis names the interception (§13.4).
+                // The stream arm used to drop the flag entirely — a blocked
+                // stream finished "stop" with the generic diagnosis.
+                self.blocked_seen = true;
             }
             Ev::Error(_) => unreachable!("errors routed through on_error"),
         }
@@ -382,6 +387,25 @@ mod tests {
             v["choices"][0]["message"]["content"],
             "The capital of France is Paris."
         );
+    }
+
+    #[test]
+    fn stream_blocked_finishes_content_filter_with_interception_note() {
+        // Regression (2026-08-31): the stream-mode Ev::Blocked arm dropped the
+        // flag — the finish chunk said "stop" and the §13.4 diagnosis took
+        // the generic branch instead of naming the interception.
+        let mut em = OaiEmitter::new("m", false, "", true);
+        let _ = em.on_event(&Ev::Blocked("SAFETY".into()));
+        let end = em.on_stream_end();
+        let joined = end
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .collect::<String>();
+        assert!(
+            joined.contains(r#""finish_reason":"content_filter""#),
+            "{joined}"
+        );
+        assert!(joined.contains("拦截"), "{joined}");
     }
 
     #[test]
