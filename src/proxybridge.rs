@@ -192,10 +192,12 @@ async fn write_step(stream: &mut TcpStream, buf: &[u8]) -> Result<(), StageError
 }
 
 async fn read_step(stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), StageError> {
+    // read_exact yields Result<usize, _>; the tail must map to the () shape.
     tokio::time::timeout(STEP, stream.read_exact(buf))
         .await
         .map_err(|_| StageError::ReadTimeout)?
-        .map_err(|e| StageError::ReadIo(e.to_string()))
+        .map_err(|e| StageError::ReadIo(e.to_string()))?;
+    Ok(())
 }
 
 async fn tcp_connect(ep: &SocksEndpoint) -> Result<TcpStream, StageError> {
