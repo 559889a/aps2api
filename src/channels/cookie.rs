@@ -212,8 +212,11 @@ impl CookieClient {
         self.absorb_set_cookies(&resp);
         let status = resp.status().as_u16();
         if !(200..300).contains(&status) {
-            let text = resp.text().await.unwrap_or_default();
-            tracing::debug!(status, upstream_body = %text, "batchGraphql non-2xx");
+            // Capped read (§13.2): a runaway error body must not be buffered
+            // whole; 64KB is far beyond any real error message.
+            let text = crate::channels::read_error_body(resp.bytes_stream()).await;
+            let preview: String = text.chars().take(4_096).collect();
+            tracing::debug!(status, upstream_body = %preview, "batchGraphql non-2xx");
             let mut e = errs::classify_error(Some(status), cookie_error_message(&text));
             // AUTH self-heal hint (§7.4): mark the error when the jar rolled
             // while this request was in flight — the pipeline turns that

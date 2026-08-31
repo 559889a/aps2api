@@ -77,7 +77,9 @@ impl ExpressClient {
         let resp = req.send().await.map_err(map_send_err)?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            // Capped read (§13.2): a runaway error body must not be buffered
+            // whole; 64KB is far beyond any real error message.
+            let body = crate::channels::read_error_body(resp.bytes_stream()).await;
             let msg = error_message(&body);
             return Err(errs::classify_error(Some(status.as_u16()), msg));
         }

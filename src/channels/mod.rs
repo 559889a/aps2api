@@ -307,6 +307,47 @@ pub(crate) async fn pump_single_with_limit<S, E>(
     }
 }
 
+/// Byte cap for one upstream ERROR body (spec §13.2): error bodies carry a
+/// short JSON message for logs and the client-facing hint — a hostile or
+/// broken peer must not be able to grow proxy memory through an error
+/// response (the fourth member of the unbounded-read family closed on
+/// 2026-08-31, after the pump buffers, single-JSON bodies and image reads).
+pub(crate) const MAX_ERROR_BODY: usize = 64 * 1024;
+
+/// Read an error-response body as a lossy string, stopping hard at `cap`
+/// bytes: the read is abandoned mid-stream once the cap is reached, so a
+/// runaway error body can never allocate without bound. 64KB is orders of
+/// magnitude beyond any real error message (which is truncated to 300 chars
+/// for the client anyway).
+pub(crate) async fn read_error_body<S, E>(stream: S) -> String
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    read_error_body_with_limit(stream, MAX_ERROR_BODY).await
+}
+
+pub(crate) async fn read_error_body_with_limit<S, E>(mut stream: S, cap: usize) -> String
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                buf.extend_from_slice(&bytes);
+                if buf.len() >= cap {
+                    buf.truncate(cap);
+                    break;
+                }
+            }
+            Err(_) => break, // best-effort read: report what we got
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
 /// `part.thought` may arrive as bool or as the STRING "true"/"True"/"false"
 /// (spec trap 6: a string "false" is falsy — compare by content).
 fn thought_flag(part: &Value) -> bool {
@@ -511,6 +552,33 @@ mod tests {
             Some(Ev::Error(_)) => {}
             other => panic!("expected error event, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn error_body_read_stops_at_the_cap() {
+        // A runaway error body must be abandoned mid-stream at the cap, not
+        // buffered whole (memory red line; the follow-up chunk never lands).
+        let stream = futures_util::stream::iter(vec![
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from("A".repeat(10))),
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from("B".repeat(10))),
+        ]);
+        let body = read_error_body_with_limit(stream, 12).await;
+        assert_eq!(body.len(), 12);
+        assert!(body.starts_with("AAAAAAAAAA"));
+    }
+
+    #[tokio::test]
+    async fn error_body_read_short_and_erroring_bodies() {
+        let stream = futures_util::stream::iter(vec![Ok::<Bytes, std::convert::Infallible>(
+            Bytes::from_static(b"short"),
+        )]);
+        assert_eq!(read_error_body_with_limit(stream, 64).await, "short");
+        // A transport error mid-read keeps what was received so far.
+        let stream = futures_util::stream::iter(vec![
+            Ok::<Bytes, String>(Bytes::from_static(b"par")),
+            Err("connection reset".to_string()),
+        ]);
+        assert_eq!(read_error_body_with_limit(stream, 64).await, "par");
     }
 
     #[tokio::test]
