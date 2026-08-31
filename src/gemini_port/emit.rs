@@ -257,14 +257,14 @@ impl GeminiEmitter {
                 .iter()
                 .rposition(|p| p.get("thought").is_none() && p.get("text").is_some());
             let mut rebuilt = vec![json!({ "text": self.prefill })];
-            for (i, p) in parts.iter().enumerate() {
+            for (i, p) in parts.into_iter().enumerate() {
                 let is_body_text = p.get("thought").is_none() && p.get("text").is_some();
                 if !is_body_text {
-                    rebuilt.push(p.clone());
+                    rebuilt.push(p);
                 } else if Some(i) == last_body && !stitched.is_empty() {
-                    // Matches at most once (unique position), but the
-                    // borrow checker cannot prove that across iterations.
-                    rebuilt.push(json!({ "text": stitched.clone() }));
+                    // Matches at most once (unique position): move the stitched
+                    // body text in place of the last body part.
+                    rebuilt.push(json!({ "text": std::mem::take(&mut stitched) }));
                 }
             }
             parts = rebuilt;
