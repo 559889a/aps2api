@@ -17,6 +17,14 @@ use serde_json::Value;
 
 const MAX_REDIRECTS: usize = 3;
 const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+/// Cumulative cap on the inline image data ONE request may accumulate through
+/// remoteFetch resolution (base64 characters, spec §9.3): every fetched image
+/// stays in the payload simultaneously, so per-image caps alone still let a
+/// request with many remoteFetch parts grow without bound (20 images × 20MB ×
+/// the 4/3 base64 expansion ≈ 500MB — memory red line, closed 2026-08-31).
+/// Matching the request-body cap keeps the expanded payload in the order the
+/// ports already accept.
+const MAX_TOTAL_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
 fn blocked_ip(ip: IpAddr) -> bool {
     match ip {
@@ -165,6 +173,22 @@ where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Result<(String, String), String>>,
 {
+    resolve_remote_parts_with_limit(parts, fetch, MAX_TOTAL_IMAGE_BYTES).await
+}
+
+/// Cap-bounded core of [`resolve_remote_parts`]: once the accumulated inline
+/// image data reaches `max_total`, further fetches are treated as failures
+/// (part dropped with a warning — the same semantics as a 404), which bounds
+/// the expanded payload instead of silently changing it.
+pub async fn resolve_remote_parts_with_limit<F, Fut>(
+    parts: &mut Vec<Value>,
+    fetch: F,
+    max_total: usize,
+) where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<(String, String), String>>,
+{
+    let mut total = 0usize;
     let mut i = 0;
     while i < parts.len() {
         let Some(url) = parts[i]
@@ -177,6 +201,17 @@ where
         };
         match fetch(url.clone()).await {
             Ok((mime, b64)) => {
+                total += b64.len();
+                if total > max_total {
+                    tracing::warn!(
+                        url = %url,
+                        total_bytes = total,
+                        limit = max_total,
+                        "remote image dropped: cumulative inline image data exceeded the request limit"
+                    );
+                    parts.remove(i);
+                    continue;
+                }
                 parts[i] = serde_json::json!({
                     "inlineData": { "mimeType": mime, "data": b64 }
                 });
@@ -244,5 +279,30 @@ mod tests {
         ];
         resolve_remote_parts(&mut parts, |_url| async { Err("nope".to_string()) }).await;
         assert!(parts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cumulative_cap_drops_excess_images_keeps_earlier_ones() {
+        // Two images, cumulative cap set between them: the first stays, the
+        // second is dropped with the limit warning — same semantics as a
+        // failed fetch (memory red line: per-image caps alone left the total
+        // unbounded).
+        let mut parts = vec![
+            serde_json::json!({ "remoteFetch": "http://x/a.png" }),
+            serde_json::json!({ "remoteFetch": "http://x/b.png" }),
+            serde_json::json!({ "remoteFetch": "http://x/c.png" }),
+        ];
+        resolve_remote_parts_with_limit(
+            &mut parts,
+            |url| async move {
+                let n = url.rsplit('/').next().unwrap().chars().next().unwrap();
+                Ok(("image/png".to_string(), n.to_string().repeat(10)))
+            },
+            25,
+        )
+        .await;
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["inlineData"]["data"], "a".repeat(10));
+        assert_eq!(parts[1]["inlineData"]["data"], "c".repeat(10));
     }
 }
