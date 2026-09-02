@@ -20,3 +20,10 @@ vs-fix.cmd
 
 # cookie jar (runtime-rolled cookie values, spec 7.4; real credentials, never commit)
 cookie.jar.yaml
+
+# 抓取的凭据与本地工具（推送红线：真实凭据/抓包材料永不入库）
+cookies.jsonl
+cookie_string.txt
+get_cookies.py
+proxy-node.md
+__pycache__/
