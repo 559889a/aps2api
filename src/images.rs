@@ -168,27 +168,16 @@ fn use_base64(data: &[u8]) -> String {
 /// the part after a dropped one and eventually indexes out of bounds (panic).
 /// `fetch` receives an owned URL and returns a self-contained future (capture
 /// whatever it needs by value — e.g. clone the shared client into itself).
-pub async fn resolve_remote_parts<F, Fut>(parts: &mut Vec<Value>, fetch: F)
+///
+/// `budget` is the REQUEST-wide remaining allowance, threaded across every
+/// turn by the caller: a per-call counter caps each turn separately, which
+/// left a 30-turn conversation free to inline 30 × the cap (memory red line —
+/// per-turn accounting was the 2026-08-31 cumulative fix's blind spot).
+pub async fn resolve_remote_parts<F, Fut>(parts: &mut Vec<Value>, fetch: F, budget: &mut usize)
 where
     F: Fn(String) -> Fut,
     Fut: std::future::Future<Output = Result<(String, String), String>>,
 {
-    resolve_remote_parts_with_limit(parts, fetch, MAX_TOTAL_IMAGE_BYTES).await
-}
-
-/// Cap-bounded core of [`resolve_remote_parts`]: once the accumulated inline
-/// image data reaches `max_total`, further fetches are treated as failures
-/// (part dropped with a warning — the same semantics as a 404), which bounds
-/// the expanded payload instead of silently changing it.
-pub async fn resolve_remote_parts_with_limit<F, Fut>(
-    parts: &mut Vec<Value>,
-    fetch: F,
-    max_total: usize,
-) where
-    F: Fn(String) -> Fut,
-    Fut: std::future::Future<Output = Result<(String, String), String>>,
-{
-    let mut total = 0usize;
     let mut i = 0;
     while i < parts.len() {
         let Some(url) = parts[i]
@@ -201,17 +190,17 @@ pub async fn resolve_remote_parts_with_limit<F, Fut>(
         };
         match fetch(url.clone()).await {
             Ok((mime, b64)) => {
-                total += b64.len();
-                if total > max_total {
+                if b64.len() > *budget {
                     tracing::warn!(
                         url = %url,
-                        total_bytes = total,
-                        limit = max_total,
+                        image_bytes = b64.len(),
+                        remaining = *budget,
                         "remote image dropped: cumulative inline image data exceeded the request limit"
                     );
                     parts.remove(i);
                     continue;
                 }
+                *budget -= b64.len();
                 parts[i] = serde_json::json!({
                     "inlineData": { "mimeType": mime, "data": b64 }
                 });
@@ -223,6 +212,11 @@ pub async fn resolve_remote_parts_with_limit<F, Fut>(
             }
         }
     }
+}
+
+/// Fresh per-request budget for [`resolve_remote_parts`] (spec §9.3).
+pub fn image_budget() -> usize {
+    MAX_TOTAL_IMAGE_BYTES
 }
 
 #[cfg(test)]
@@ -257,18 +251,25 @@ mod tests {
             serde_json::json!({ "remoteFetch": "http://x/ok.png" }),
             serde_json::json!({ "text": "bye" }),
         ];
-        resolve_remote_parts(&mut parts, |url| async move {
-            if url.ends_with("fail.png") {
-                Err("remote image rejected: HTTP 404".to_string())
-            } else {
-                Ok(("image/png".to_string(), "QQ==".to_string()))
-            }
-        })
+        let mut budget = image_budget();
+        resolve_remote_parts(
+            &mut parts,
+            |url| async move {
+                if url.ends_with("fail.png") {
+                    Err("remote image rejected: HTTP 404".to_string())
+                } else {
+                    Ok(("image/png".to_string(), "QQ==".to_string()))
+                }
+            },
+            &mut budget,
+        )
         .await;
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0]["text"], "hi");
         assert_eq!(parts[1]["inlineData"]["data"], "QQ==");
         assert_eq!(parts[2]["text"], "bye");
+        // Only the successful fetch consumed budget.
+        assert_eq!(budget, image_budget() - 4);
     }
 
     #[tokio::test]
@@ -277,14 +278,21 @@ mod tests {
             serde_json::json!({ "remoteFetch": "http://x/a.png" }),
             serde_json::json!({ "remoteFetch": "http://x/b.png" }),
         ];
-        resolve_remote_parts(&mut parts, |_url| async { Err("nope".to_string()) }).await;
+        let mut budget = image_budget();
+        resolve_remote_parts(
+            &mut parts,
+            |_url| async { Err::<(String, String), String>("nope".to_string()) },
+            &mut budget,
+        )
+        .await;
         assert!(parts.is_empty());
+        assert_eq!(budget, image_budget());
     }
 
     #[tokio::test]
     async fn cumulative_cap_drops_excess_images_keeps_earlier_ones() {
-        // Three 10-byte images, cumulative cap 25: a and b fit (10 + 10 <= 25;
-        // c would push the total to 30) — c is dropped with the limit warning,
+        // Three 10-byte images, budget 25: a and b fit (10 + 10 <= 25; c would
+        // need 10 of the 5 that remain) — c is dropped with the limit warning,
         // a and b stay. Semantics identical to a failed fetch (memory red
         // line: per-image caps alone left the total unbounded).
         let mut parts = vec![
@@ -292,17 +300,37 @@ mod tests {
             serde_json::json!({ "remoteFetch": "http://x/b.png" }),
             serde_json::json!({ "remoteFetch": "http://x/c.png" }),
         ];
-        resolve_remote_parts_with_limit(
+        let mut budget = 25usize;
+        resolve_remote_parts(
             &mut parts,
             |url| async move {
                 let n = url.rsplit('/').next().unwrap().chars().next().unwrap();
                 Ok(("image/png".to_string(), n.to_string().repeat(10)))
             },
-            25,
+            &mut budget,
         )
         .await;
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["inlineData"]["data"], "a".repeat(10));
         assert_eq!(parts[1]["inlineData"]["data"], "b".repeat(10));
+        assert_eq!(budget, 5);
+    }
+
+    #[tokio::test]
+    async fn the_budget_spans_every_turn_of_one_request() {
+        // Per-turn accounting let a long conversation inline N × the cap; the
+        // budget is threaded by the caller, so turn 2 only gets what turn 1
+        // left over.
+        let fetch = |_url: String| async {
+            Ok::<(String, String), String>(("image/png".into(), "x".repeat(10)))
+        };
+        let mut budget = 15usize;
+        let mut turn1 = vec![serde_json::json!({ "remoteFetch": "http://x/a.png" })];
+        let mut turn2 = vec![serde_json::json!({ "remoteFetch": "http://x/b.png" })];
+        resolve_remote_parts(&mut turn1, fetch, &mut budget).await;
+        resolve_remote_parts(&mut turn2, fetch, &mut budget).await;
+        assert_eq!(turn1.len(), 1, "first turn's image fits");
+        assert!(turn2.is_empty(), "second turn exceeds the request budget");
+        assert_eq!(budget, 5);
     }
 }

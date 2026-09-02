@@ -268,6 +268,8 @@ async fn handle_inner(
     }
 }
 
+/// Same as the OAI port's resolver: the image size budget is REQUEST-wide and
+/// threaded across turns (spec §9.3).
 async fn fetch_remote_parts(state: &AppState, contents: &mut [Value]) {
     let client = state.ctx.image_client.clone();
     let proxied = state.config.socks5.is_some();
@@ -275,11 +277,12 @@ async fn fetch_remote_parts(state: &AppState, contents: &mut [Value]) {
         let client = client.clone();
         async move { crate::images::fetch_remote_image(&client, proxied, &url).await }
     };
+    let mut budget = crate::images::image_budget();
     for turn in contents.iter_mut() {
         let Some(parts) = turn.get_mut("parts").and_then(Value::as_array_mut) else {
             continue;
         };
-        crate::images::resolve_remote_parts(parts, &fetch).await;
+        crate::images::resolve_remote_parts(parts, &fetch, &mut budget).await;
     }
 }
 

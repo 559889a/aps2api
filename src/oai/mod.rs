@@ -226,7 +226,9 @@ pub fn resolve_model_name(
 }
 
 /// Replace remote-fetch placeholders (produced by oai::parse) with inlineData
-/// parts (spec §9.3). Failures log a warning and drop the part.
+/// parts (spec §9.3). Failures log a warning and drop the part. The size
+/// budget is REQUEST-wide: it spans every turn, so a long conversation cannot
+/// inline one cap's worth of images per turn.
 async fn fetch_remote_parts(state: &AppState, contents: &mut [Value]) {
     let client = state.ctx.image_client.clone();
     let proxied = state.config.socks5.is_some();
@@ -234,10 +236,11 @@ async fn fetch_remote_parts(state: &AppState, contents: &mut [Value]) {
         let client = client.clone();
         async move { crate::images::fetch_remote_image(&client, proxied, &url).await }
     };
+    let mut budget = crate::images::image_budget();
     for turn in contents.iter_mut() {
         let Some(parts) = turn.get_mut("parts").and_then(Value::as_array_mut) else {
             continue;
         };
-        crate::images::resolve_remote_parts(parts, &fetch).await;
+        crate::images::resolve_remote_parts(parts, &fetch, &mut budget).await;
     }
 }
