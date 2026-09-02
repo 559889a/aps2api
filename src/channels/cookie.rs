@@ -264,8 +264,16 @@ impl CookieClient {
 /// carry the word "timeout" in their message — decide by error TYPE, the
 /// same way the express channel does with `reqwest::Error::is_connect()`
 /// (2026-08-30 fix: string-only matching misfiled them as terminal Invalid).
+///
+/// `is_request()` widens that to the whole request-execution phase: a
+/// connection dying mid-request (TLS reset, HTTP/2 GOAWAY) is neither a
+/// connect nor a timeout error, and its message says so in neither word.
 fn map_send_err(e: wreq::Error) -> UpstreamError {
-    classify_send_failure(e.is_connect(), e.is_timeout(), e.to_string())
+    classify_send_failure(
+        e.is_connect() || e.is_request(),
+        e.is_timeout(),
+        e.to_string(),
+    )
 }
 
 fn classify_send_failure(is_connect: bool, is_timeout: bool, message: String) -> UpstreamError {

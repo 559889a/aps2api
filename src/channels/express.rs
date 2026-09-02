@@ -114,9 +114,22 @@ pub fn log_outbound(payload: &Value) {
 }
 
 /// Transport failures before/while the request runs are retryable (§12.1).
+///
+/// Classified by error TYPE, not by wording. `is_connect`/`is_timeout` miss a
+/// connection that dies mid-request (TLS reset, HTTP/2 GOAWAY, peer closed
+/// while the request was in flight): those arrive as a plain request-phase
+/// error whose message mentions neither, so the string match filed them as
+/// terminal `Invalid` and the retry never happened — the same class of bug the
+/// cookie channel hit on 2026-08-30. `is_request()` covers the whole
+/// request-execution phase; builder errors (our own bad URL/JSON) are a
+/// different kind and stay deterministic.
 fn map_send_err(e: reqwest::Error) -> UpstreamError {
     let message = e.to_string();
-    if e.is_connect() || e.is_timeout() || message.to_lowercase().contains("timeout") {
+    if e.is_connect()
+        || e.is_timeout()
+        || e.is_request()
+        || message.to_lowercase().contains("timeout")
+    {
         UpstreamError {
             kind: ErrorKind::Transport,
             status: None,
