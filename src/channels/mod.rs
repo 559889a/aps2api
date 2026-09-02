@@ -16,18 +16,37 @@ use crate::ir::{ErrorKind, Ev, UpstreamError};
 
 /// Started upstream attempt: a live event stream plus the ability to detect
 /// that the upstream closed without any error event.
+///
+/// Owns the reader task that pumps the upstream HTTP body, and ABORTS it on
+/// drop (spec §12.3 cancellation): the reader holds the upstream response, so
+/// dropping this handle must release that response — and with it the TCP/HTTP2
+/// stream, which is what actually tells Google to stop generating (on HTTP/2 a
+/// dropped body is an RST_STREAM). Without the abort the reader kept draining
+/// the body after nobody was listening: it only noticed at its next `send`,
+/// and `pump_single` performs no send at all until the WHOLE body has been
+/// read — i.e. a canceled request still burned a full response worth of quota
+/// (2026-09-02 owner bug report).
 pub struct EvStream {
     rx: mpsc::Receiver<Ev>,
+    pump: tokio::task::JoinHandle<()>,
 }
 
 impl EvStream {
-    pub fn new(rx: mpsc::Receiver<Ev>) -> Self {
-        EvStream { rx }
+    pub fn new(rx: mpsc::Receiver<Ev>, pump: tokio::task::JoinHandle<()>) -> Self {
+        EvStream { rx, pump }
     }
 
     /// Next event, or None when the upstream stream ended.
     pub async fn next(&mut self) -> Option<Ev> {
         self.rx.recv().await
+    }
+}
+
+impl Drop for EvStream {
+    fn drop(&mut self) {
+        // Abort, not "let it finish": the task is parked on the upstream body
+        // read, so aborting is what drops the response object.
+        self.pump.abort();
     }
 }
 
@@ -482,6 +501,33 @@ pub fn extract_from_chunk(chunk: &mut Value, out: &mut Vec<Ev>) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn dropping_the_stream_aborts_the_reader_and_releases_the_response() {
+        // Quota red line (§12.3): the reader task holds the upstream response,
+        // so the EvStream's Drop must abort it. Otherwise a canceled request
+        // keeps draining (and paying for) the whole generation — pump_single
+        // in particular performs no send at all before the body is complete,
+        // so it cannot notice the gone client by itself.
+        let (alive_tx, alive_rx) = tokio::sync::oneshot::channel::<()>();
+        let (_tx, rx) = mpsc::channel::<Ev>(4);
+        // Stands in for a reader parked on an upstream body that keeps coming:
+        // it holds the oneshot sender, so the sender is dropped exactly when
+        // the task itself is dropped.
+        let pump = tokio::spawn(async move {
+            let _holds_upstream = alive_tx;
+            std::future::pending::<()>().await;
+        });
+        let stream = EvStream::new(rx, pump);
+        drop(stream);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), alive_rx)
+            .await
+            .expect("the reader task must be dropped, not left running");
+        assert!(
+            outcome.is_err(),
+            "the sender must have been dropped with the aborted task"
+        );
+    }
 
     #[tokio::test]
     async fn sse_lines_parse_in_place() {

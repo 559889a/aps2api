@@ -84,14 +84,20 @@ impl ExpressClient {
             return Err(errs::classify_error(Some(status.as_u16()), msg));
         }
         let (tx, rx) = mpsc::channel::<Ev>(64);
-        if stream {
-            tokio::spawn(crate::channels::pump_sse(resp.bytes_stream(), tx));
+        // The pump handle travels with the EvStream: dropping the stream
+        // ABORTS this task, which drops the upstream response and closes its
+        // HTTP/2 stream — that is what makes the upstream stop generating when
+        // the client cancels (spec §12.3). It matters most for the
+        // non-streaming pump, which performs no send at all before the whole
+        // body has been read and therefore cannot notice a gone client itself.
+        let pump = if stream {
+            tokio::spawn(crate::channels::pump_sse(resp.bytes_stream(), tx))
         } else {
             // Streaming accumulation with the 64MB cap inside pump_single:
             // an unbounded whole-body read is a memory red line.
-            tokio::spawn(crate::channels::pump_single(resp.bytes_stream(), tx));
-        }
-        Ok(EvStream::new(rx))
+            tokio::spawn(crate::channels::pump_single(resp.bytes_stream(), tx))
+        };
+        Ok(EvStream::new(rx, pump))
     }
 }
 

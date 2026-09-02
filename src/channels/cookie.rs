@@ -231,12 +231,15 @@ impl CookieClient {
             return Err(e);
         }
         let (tx, rx) = mpsc::channel::<Ev>(64);
-        tokio::spawn(crate::channels::pump_concat(
+        // Pump handle travels with the EvStream so dropping the stream aborts
+        // the reader and releases the upstream response (spec §12.3
+        // cancellation).
+        let pump = tokio::spawn(crate::channels::pump_concat(
             resp.bytes_stream(),
             tx,
             cookie_extract,
         ));
-        Ok(EvStream::new(rx))
+        Ok(EvStream::new(rx, pump))
     }
 
     /// Merge every Set-Cookie header of one response into the jar.

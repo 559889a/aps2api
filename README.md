@@ -215,6 +215,7 @@ The server logs to stdout at `info` level by default (override with `RUST_LOG`, 
 | `stream complete` | INFO | the stream ended normally: `total_s` wall clock, `gen_s` first-token→end window, `retries` consumed, and output size/speed — `tokens`/`tps` when the upstream reports usage (express), `tokens_est`/`tps_est` when it does not (cookie) |
 | `bypass complete` | INFO | a fake-streaming bypass request finished: `total_s` from request receipt to the completed upstream call, `prep_us`, `retries` (bypass has no first token to time, so there is no `upstream first response` line) |
 | `upstream failed (...); returning the error to the client` | ERROR | terminal failure and its class: non-retryable, content-already-emitted (never-retry guarantee), or retry budget exhausted |
+| `client disconnected; aborting the upstream request and any pending retries` | INFO | the client hung up: the in-flight upstream request is cancelled immediately and no retry is attempted |
 
 Notes:
 
@@ -227,6 +228,10 @@ Notes:
   token); they log `bypass complete` instead.
 - Non-streaming requests log `upstream first response` (the first aggregated event is
   the first token) but no summary line.
+- When a client cancels a request, the upstream call is torn down at once rather than
+  left running to completion — that matters for quota, since an abandoned generation
+  is billed just like a delivered one. Cancellation is detected in every waiting state
+  (dialing, waiting for the first token, mid-stream gaps, and retry backoff).
 - The `prep_us` clock starts at handler entry and includes reading and JSON-parsing
   the request body on **both** ports (the OpenAI endpoint reads its body inside the
   handler for exactly this reason), so the readings are directly comparable across

@@ -150,6 +150,87 @@ fn secs_f64(d: std::time::Duration) -> f64 {
     (d.as_secs_f64() * 100.0).round() / 100.0
 }
 
+/// Client-side sender of the wire bytes (the axum body's other end).
+type WireTx = mpsc::Sender<Result<Bytes, std::convert::Infallible>>;
+
+/// The client hung up: quota red line (spec §12.3, owner bug report
+/// 2026-09-02). Every abandoned upstream attempt keeps generating — and keeps
+/// billing — until its HTTP response is dropped, so this must be visible in
+/// the log and must be followed by an immediate `return` from the pump: that
+/// drops the `EvStream`, which aborts its reader task, which drops the
+/// upstream response and resets the stream.
+fn log_disconnect(channel: Channel, model: &str) {
+    tracing::info!(
+        channel = channel_name(channel),
+        model = %model,
+        "client disconnected; aborting the upstream request and any pending retries"
+    );
+}
+
+/// Await `fut` unless the client hangs up first; `None` = client gone.
+///
+/// Every await inside a streaming pump goes through this. Without it the pump
+/// only learned about a gone client at its next SUCCESSFUL send, so a cancel
+/// during dialing, during the wait for the first token, or in any mid-stream
+/// gap left the upstream generating a full response nobody would ever read —
+/// the reported quota burn. `biased` checks the disconnect first so an already
+/// gone client never gets one more upstream request.
+async fn unless_disconnected<F>(tx: &WireTx, fut: F) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        biased;
+        _ = tx.closed() => None,
+        v = fut => Some(v),
+    }
+}
+
+/// Logs the disconnect when a NON-streaming request is dropped mid-flight.
+///
+/// The non-streaming pumps have no client-facing channel to watch: hyper drops
+/// the whole handler future when the connection dies, which cancels the
+/// upstream request through the same `EvStream` drop path. That teardown is
+/// correct but invisible, and spec §16.2 requires the disconnect to be
+/// visible in the log — so the guard reports it from `Drop`.
+struct CancelGuard {
+    channel: Channel,
+    model: String,
+    completed: bool,
+}
+
+impl CancelGuard {
+    fn new(channel: Channel, model: &str) -> Self {
+        CancelGuard {
+            channel,
+            model: model.to_string(),
+            completed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            log_disconnect(self.channel, &self.model);
+        }
+    }
+}
+
+/// Write one emitter batch to the client; `false` = the client is gone.
+async fn send_all(tx: &WireTx, chunks: Vec<Bytes>) -> bool {
+    for b in chunks {
+        if tx.send(Ok(b)).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Output token count from a `usageMetadata` object: candidatesTokenCount
 /// plus thoughtsTokenCount when present — thought text is part of the
 /// streamed output, so both count toward generation speed. None when the
@@ -212,16 +293,16 @@ pub async fn run_stream(
         let client = match client_owned {
             Ok(c) => c,
             Err(e) => {
-                for b in em.on_error(&UpstreamError {
-                    kind: ErrorKind::Invalid,
-                    status: Some(400),
-                    message: e.message,
-                    jar_refreshed_since_send: false,
-                }) {
-                    if tx.send(Ok(b)).await.is_err() {
-                        return;
-                    }
-                }
+                send_all(
+                    &tx,
+                    em.on_error(&UpstreamError {
+                        kind: ErrorKind::Invalid,
+                        status: Some(400),
+                        message: e.message,
+                        jar_refreshed_since_send: false,
+                    }),
+                )
+                .await;
                 return;
             }
         };
@@ -251,7 +332,19 @@ pub async fn run_stream(
             // Each attempt rebuilds the request inside start(): cookie
             // regenerates requestContext + SAPISIDHASH; express rebuilds the
             // request object (body is time-independent, §12.3).
-            let mut stream = match client.start(&payload, &model, stream_flag).await {
+            //
+            // Guarded by the disconnect watch: a client that cancels during
+            // dialing/TLS must not leave a request running upstream (quota red
+            // line). Dropping the start future cancels the in-flight request.
+            let start_fut = client.start(&payload, &model, stream_flag);
+            let started_stream = match unless_disconnected(&tx, start_fut).await {
+                Some(v) => v,
+                None => {
+                    log_disconnect(channel, &model);
+                    return;
+                }
+            };
+            let mut stream = match started_stream {
                 Ok(s) => s,
                 Err(e) => {
                     if !emitted && e.retryable() && attempt < cfg.retry.max {
@@ -271,6 +364,7 @@ pub async fn run_stream(
                         )
                         .await
                         {
+                            log_disconnect(channel, &model);
                             return; // client gone
                         }
                         continue 'outer;
@@ -289,21 +383,27 @@ pub async fn run_stream(
                         continue 'outer;
                     }
                     log_give_up(channel, &model, attempt, cfg.retry.max, emitted, &e);
-                    for b in em.on_error(&e) {
-                        if tx.send(Ok(b)).await.is_err() {
-                            return;
-                        }
-                    }
+                    send_all(&tx, em.on_error(&e)).await;
                     return;
                 }
             };
 
-            // First-response budget: 30s to the first semantic event.
-            let first = match tokio::time::timeout(retry::FIRST_RESPONSE_BUDGET, stream.next())
-                .await
-            {
-                Ok(v) => v,
-                Err(_elapsed) => {
+            // First-response budget: 30s to the first semantic event. The
+            // disconnect watch runs alongside it: the whole point of the
+            // budget window is that the upstream is silent, so a send failure
+            // could not detect the cancel here. The inner block confines the
+            // borrow of `stream` to the wait itself.
+            let first_outcome = {
+                let wait = tokio::time::timeout(retry::FIRST_RESPONSE_BUDGET, stream.next());
+                unless_disconnected(&tx, wait).await
+            };
+            let first = match first_outcome {
+                Some(Ok(v)) => v,
+                None => {
+                    log_disconnect(channel, &model);
+                    return;
+                }
+                Some(Err(_elapsed)) => {
                     if !emitted && attempt < cfg.retry.max {
                         attempt += 1;
                         log_retry(
@@ -321,6 +421,7 @@ pub async fn run_stream(
                         )
                         .await
                         {
+                            log_disconnect(channel, &model);
                             return;
                         }
                         continue 'outer;
@@ -332,11 +433,7 @@ pub async fn run_stream(
                         jar_refreshed_since_send: false,
                     };
                     log_give_up(channel, &model, attempt, cfg.retry.max, false, &e);
-                    for b in em.on_error(&e) {
-                        if tx.send(Ok(b)).await.is_err() {
-                            return;
-                        }
-                    }
+                    send_all(&tx, em.on_error(&e)).await;
                     return;
                 }
             };
@@ -433,11 +530,10 @@ pub async fn run_stream(
                             ),
                         }
                     }
-                    for b in em.on_stream_end() {
-                        if tx.send(Ok(b)).await.is_err() {
-                            return;
-                        }
-                    }
+                    // The stream is already complete: a failed write here means
+                    // the client left with the answer in flight, which is not
+                    // a cancellation (nothing upstream is left to abort).
+                    send_all(&tx, em.on_stream_end()).await;
                     return;
                 };
                 if let Ev::Error(e) = ev {
@@ -458,16 +554,13 @@ pub async fn run_stream(
                         )
                         .await
                         {
+                            log_disconnect(channel, &model);
                             return;
                         }
                         continue 'outer;
                     }
                     log_give_up(channel, &model, attempt, cfg.retry.max, emitted, &e);
-                    for b in em.on_error(&e) {
-                        if tx.send(Ok(b)).await.is_err() {
-                            return;
-                        }
-                    }
+                    send_all(&tx, em.on_error(&e)).await;
                     return;
                 }
                 emitted = true;
@@ -479,13 +572,27 @@ pub async fn run_stream(
                     ascii_chars += a;
                     other_chars += o;
                 }
-                for b in em.on_event(&ev) {
-                    if tx.send(Ok(b)).await.is_err() {
-                        return; // client disconnected: stop everything
+                if !send_all(&tx, em.on_event(&ev)).await {
+                    // Client disconnected: returning drops the EvStream, which
+                    // aborts its reader task and closes the upstream response
+                    // — the upstream stops generating (quota red line).
+                    log_disconnect(channel, &model);
+                    return;
+                }
+                let next_ev = {
+                    let wait = stream.next();
+                    unless_disconnected(&tx, wait).await
+                };
+                match next_ev {
+                    Some(v) => next = v,
+                    None => {
+                        // Mid-stream cancel in a silent gap: no send is due,
+                        // so only the watch can see it. The upstream would
+                        // otherwise run to completion on our quota.
+                        log_disconnect(channel, &model);
+                        return;
                     }
                 }
-                // No more budget deadline: first event already seen.
-                next = stream.next().await;
             }
         }
     });
@@ -494,6 +601,12 @@ pub async fn run_stream(
 
 /// Non-streaming execution: aggregates events into the port result.
 /// Heartbeats do not apply; retryable failures still loop.
+///
+/// Cancellation (spec §12.3): this runs INSIDE the request handler, so a
+/// client hangup makes hyper drop the whole handler future — which drops the
+/// in-flight `start()` future or the `EvStream`, cancelling the upstream
+/// request either way. `CancelGuard` exists to make that teardown visible in
+/// the log; the teardown itself is structural.
 pub async fn run_nonstream(
     ctx: &Ctx,
     channel: Channel,
@@ -510,6 +623,7 @@ pub async fn run_nonstream(
         jar_refreshed_since_send: false,
     })?;
     let model = ir.model.clone();
+    let mut cancel_guard = CancelGuard::new(channel, &model);
     let mut attempt: u32 = 0;
     let mut emitted = false;
     // One-shot cookie self-heal latch (spec §7.4).
@@ -551,6 +665,7 @@ pub async fn run_nonstream(
                     continue 'outer;
                 }
                 log_give_up(channel, &model, attempt, cfg.retry.max, emitted, &e);
+                cancel_guard.disarm();
                 return Err(e);
             }
         };
@@ -578,6 +693,7 @@ pub async fn run_nonstream(
                     jar_refreshed_since_send: false,
                 };
                 log_give_up(channel, &model, attempt, cfg.retry.max, false, &e);
+                cancel_guard.disarm();
                 return Err(e);
             }
         };
@@ -598,6 +714,7 @@ pub async fn run_nonstream(
         let mut next = first;
         loop {
             let Some(ev) = next else {
+                cancel_guard.disarm();
                 return Ok(em.take_result());
             };
             if let Ev::Error(e) = ev {
@@ -615,6 +732,7 @@ pub async fn run_nonstream(
                     continue 'outer;
                 }
                 log_give_up(channel, &model, attempt, cfg.retry.max, emitted, &e);
+                cancel_guard.disarm();
                 return Err(e);
             }
             emitted = true;
@@ -659,16 +777,16 @@ pub async fn run_bypass(
         let client = match client_owned {
             Ok(c) => c,
             Err(e) => {
-                for b in em.on_error(&UpstreamError {
-                    kind: ErrorKind::Invalid,
-                    status: Some(400),
-                    message: e.message,
-                    jar_refreshed_since_send: false,
-                }) {
-                    if tx.send(Ok(b)).await.is_err() {
-                        return;
-                    }
-                }
+                send_all(
+                    &tx,
+                    em.on_error(&UpstreamError {
+                        kind: ErrorKind::Invalid,
+                        status: Some(400),
+                        message: e.message,
+                        jar_refreshed_since_send: false,
+                    }),
+                )
+                .await;
                 return;
             }
         };
@@ -684,11 +802,24 @@ pub async fn run_bypass(
             // generation produced zero heartbeats when only the body phase
             // was monitored). timeout() cancels only its own poll tick, the
             // pinned future keeps its progress (I/O wakes drive it forward).
+            //
+            // A heartbeat write failure is the disconnect signal, but only at
+            // 3s granularity and only if a write is due; the disconnect watch
+            // makes a cancel abort the upstream request immediately (dropping
+            // the pinned future cancels the request — quota red line).
             let start_fut = client.start(&payload, &model, false);
             tokio::pin!(start_fut);
             let mut waited = std::time::Duration::ZERO;
             let mut stream = loop {
-                match tokio::time::timeout(retry::HEARTBEAT_EVERY, start_fut.as_mut()).await {
+                let polled = {
+                    let tick = tokio::time::timeout(retry::HEARTBEAT_EVERY, start_fut.as_mut());
+                    unless_disconnected(&tx, tick).await
+                };
+                let Some(polled) = polled else {
+                    log_disconnect(Channel::Express, &model);
+                    return;
+                };
+                match polled {
                     Ok(Ok(s)) => break s,
                     Ok(Err(e)) => {
                         if e.retryable() && attempt < cfg.retry.max {
@@ -708,16 +839,13 @@ pub async fn run_bypass(
                             )
                             .await
                             {
+                                log_disconnect(Channel::Express, &model);
                                 return; // client gone
                             }
                             continue 'outer;
                         }
                         log_give_up(Channel::Express, &model, attempt, cfg.retry.max, false, &e);
-                        for b in em.on_error(&e) {
-                            if tx.send(Ok(b)).await.is_err() {
-                                return;
-                            }
-                        }
+                        send_all(&tx, em.on_error(&e)).await;
                         return;
                     }
                     Err(_elapsed) => {
@@ -740,6 +868,7 @@ pub async fn run_bypass(
                                 )
                                 .await
                                 {
+                                    log_disconnect(Channel::Express, &model);
                                     return;
                                 }
                                 continue 'outer;
@@ -762,11 +891,7 @@ pub async fn run_bypass(
                                 false,
                                 &e,
                             );
-                            for b in em.on_error(&e) {
-                                if tx.send(Ok(b)).await.is_err() {
-                                    return;
-                                }
-                            }
+                            send_all(&tx, em.on_error(&e)).await;
                             return;
                         }
                         // Keep-alive + disconnect detection (3s granularity).
@@ -775,6 +900,7 @@ pub async fn run_bypass(
                             .await
                             .is_err()
                         {
+                            log_disconnect(Channel::Express, &model);
                             return; // client gone: drop upstream + pump
                         }
                     }
@@ -793,7 +919,15 @@ pub async fn run_bypass(
             let mut events_bytes: usize = 0;
             let mut flooded = false;
             let outcome = loop {
-                match tokio::time::timeout(retry::HEARTBEAT_EVERY, stream.next()).await {
+                let polled = {
+                    let tick = tokio::time::timeout(retry::HEARTBEAT_EVERY, stream.next());
+                    unless_disconnected(&tx, tick).await
+                };
+                let Some(polled) = polled else {
+                    log_disconnect(Channel::Express, &model);
+                    return;
+                };
+                match polled {
                     Ok(Some(Ev::Error(e))) => break Err(e),
                     Ok(Some(ev)) => {
                         events_bytes += match &ev {
@@ -829,6 +963,7 @@ pub async fn run_bypass(
                             .await
                             .is_err()
                         {
+                            log_disconnect(Channel::Express, &model);
                             return; // client gone: drop upstream + pump
                         }
                     }
@@ -846,11 +981,7 @@ pub async fn run_bypass(
                     jar_refreshed_since_send: false,
                 };
                 log_give_up(Channel::Express, &model, attempt, cfg.retry.max, false, &e);
-                for b in em.on_error(&e) {
-                    if tx.send(Ok(b)).await.is_err() {
-                        return;
-                    }
-                }
+                send_all(&tx, em.on_error(&e)).await;
                 return;
             }
 
@@ -873,17 +1004,12 @@ pub async fn run_bypass(
                             "bypass complete"
                         );
                         for ev in &events {
-                            for b in em.on_event(ev) {
-                                if tx.send(Ok(b)).await.is_err() {
-                                    return; // client disconnected mid-flush
-                                }
+                            if !send_all(&tx, em.on_event(ev)).await {
+                                log_disconnect(Channel::Express, &model);
+                                return; // client disconnected mid-flush
                             }
                         }
-                        for b in em.on_stream_end() {
-                            if tx.send(Ok(b)).await.is_err() {
-                                return;
-                            }
-                        }
+                        send_all(&tx, em.on_stream_end()).await;
                         return;
                     }
                 },
@@ -905,16 +1031,13 @@ pub async fn run_bypass(
                 if !retry::wait_with_heartbeat(retry::retry_delay(&cfg.retry, attempt), true, &tx)
                     .await
                 {
+                    log_disconnect(Channel::Express, &model);
                     return;
                 }
                 continue 'outer;
             }
             log_give_up(Channel::Express, &model, attempt, cfg.retry.max, false, &e);
-            for b in em.on_error(&e) {
-                if tx.send(Ok(b)).await.is_err() {
-                    return;
-                }
-            }
+            send_all(&tx, em.on_error(&e)).await;
             return;
         }
     });
