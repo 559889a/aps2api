@@ -29,12 +29,15 @@ impl AppState {
 
         // Egress wiring the clients actually dial: either the configured
         // socks5 as-is, or the loopback bridge when a transit is configured.
+        // The bridge demands per-process credentials (it is a live proxy onto
+        // the paid exit and loopback is shared with every other process on the
+        // machine), so the clients dial the URL it hands back.
         let mut egress_cfg = (*config).clone();
         if config.socks5_transit.is_some() {
             let transit = config.socks5_transit.as_deref().unwrap();
             let exit = config.socks5.as_deref().unwrap();
-            let port = crate::proxybridge::spawn_bridge(transit, exit)?;
-            egress_cfg.socks5 = Some(format!("socks5h://127.0.0.1:{port}"));
+            let bridge = crate::proxybridge::spawn_bridge(transit, exit)?;
+            egress_cfg.socks5 = Some(bridge.proxy_url());
             egress_cfg.socks5_transit = None;
         }
 

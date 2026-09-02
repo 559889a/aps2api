@@ -45,6 +45,35 @@ pub struct SocksEndpoint {
     pub password: String,
 }
 
+/// A running loopback bridge: where to dial it and the credentials it demands.
+///
+/// The bridge is a fully functional SOCKS5 proxy onto the paid residential
+/// exit, so it must not accept every process on the machine — on Android every
+/// installed app shares loopback, and on a shared desktop so does every user.
+/// It therefore requires username/password auth with a random per-process pair
+/// that only our three outbound clients receive. The values are hex so they
+/// need no percent-encoding when they go into the proxy URL.
+#[derive(Debug, Clone)]
+pub struct BridgeHandle {
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+}
+
+impl BridgeHandle {
+    /// Proxy URL for the outbound clients (proxy-side DNS, §1.4).
+    pub fn proxy_url(&self) -> String {
+        format!(
+            "socks5h://{}:{}@127.0.0.1:{}",
+            self.username, self.password, self.port
+        )
+    }
+}
+
+fn random_secret() -> String {
+    format!("{:016x}", rand::random::<u64>())
+}
+
 impl SocksEndpoint {
     pub fn parse(url: &str) -> Result<Self, String> {
         let parsed = reqwest::Url::parse(url).map_err(|e| format!("invalid proxy url: {e}"))?;
@@ -342,18 +371,19 @@ pub async fn dial_via_chain(
     Ok(stream)
 }
 
-/// Bind the loopback bridge and spawn its accept loop; returns the bound
-/// port. Must be called inside the tokio runtime. The accept task lives for
-/// the whole process; per-connection chain failures reply SOCKS5 general
-/// failure (the HTTP stacks turn that into a connect error → retryable
-/// transport error, spec §12.1) and log a WARN naming the failing stage.
-pub fn spawn_bridge(transit_url: &str, exit_url: &str) -> Result<u16, String> {
+/// Bind the loopback bridge and spawn its accept loop; returns how the
+/// outbound clients reach it (port + the generated credentials). Must be
+/// called inside the tokio runtime. The accept task lives for the whole
+/// process; per-connection chain failures reply SOCKS5 general failure (the
+/// HTTP stacks turn that into a connect error → retryable transport error,
+/// spec §12.1) and log a WARN naming the failing stage.
+pub fn spawn_bridge(transit_url: &str, exit_url: &str) -> Result<BridgeHandle, String> {
     let transit = SocksEndpoint::parse(transit_url).map_err(|e| format!("socks5_transit: {e}"))?;
     let exit = SocksEndpoint::parse(exit_url).map_err(|e| format!("socks5: {e}"))?;
     spawn_bridge_ep(&transit, &exit)
 }
 
-fn spawn_bridge_ep(transit: &SocksEndpoint, exit: &SocksEndpoint) -> Result<u16, String> {
+fn spawn_bridge_ep(transit: &SocksEndpoint, exit: &SocksEndpoint) -> Result<BridgeHandle, String> {
     let std_listener = std::net::TcpListener::bind("127.0.0.1:0")
         .map_err(|e| format!("proxy bridge cannot bind loopback: {e}"))?;
     std_listener
@@ -365,26 +395,38 @@ fn spawn_bridge_ep(transit: &SocksEndpoint, exit: &SocksEndpoint) -> Result<u16,
         .local_addr()
         .map_err(|e| format!("proxy bridge local_addr: {e}"))?
         .port();
+    let handle = BridgeHandle {
+        port,
+        username: random_secret(),
+        password: random_secret(),
+    };
     tracing::info!(
         listen = %format!("127.0.0.1:{port}"),
         transit = %transit.addr(),
         exit = %exit.addr(),
-        "proxy bridge up: outbound clients → loopback bridge → transit → socks5 exit"
+        "proxy bridge up (loopback, password-protected): outbound clients → bridge → transit → socks5 exit"
     );
     let transit = Arc::new(transit.clone());
     let exit = Arc::new(exit.clone());
-    tokio::spawn(accept_loop(listener, transit, exit));
-    Ok(port)
+    let auth = Arc::new((handle.username.clone(), handle.password.clone()));
+    tokio::spawn(accept_loop(listener, transit, exit, auth));
+    Ok(handle)
 }
 
-async fn accept_loop(listener: TcpListener, transit: Arc<SocksEndpoint>, exit: Arc<SocksEndpoint>) {
+async fn accept_loop(
+    listener: TcpListener,
+    transit: Arc<SocksEndpoint>,
+    exit: Arc<SocksEndpoint>,
+    auth: Arc<(String, String)>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let transit = transit.clone();
                 let exit = exit.clone();
+                let auth = auth.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_conn(stream, &transit, &exit).await {
+                    if let Err(e) = serve_conn(stream, &transit, &exit, &auth).await {
                         tracing::debug!(error = %e, "proxy bridge connection ended with an error");
                     }
                 });
@@ -398,16 +440,21 @@ async fn accept_loop(listener: TcpListener, transit: Arc<SocksEndpoint>, exit: A
     }
 }
 
-/// Serve one loopback SOCKS5 client: no-auth greeting → CONNECT → chain dial
-/// → bidirectional splice. Only CONNECT is supported (the HTTP clients never
-/// send BIND/UDP). Every read is bounded by the protocol itself (greeting
-/// ≤ 2+255 bytes, request ≤ 4+1+255+2) and by STEP timeouts.
+/// Serve one loopback SOCKS5 client: username/password greeting → CONNECT →
+/// chain dial → bidirectional splice. Only CONNECT is supported (the HTTP
+/// clients never send BIND/UDP). Every read is bounded by the protocol itself
+/// (greeting ≤ 2+255 bytes, request ≤ 4+1+255+2) and by STEP timeouts.
+///
+/// Auth is mandatory: the bridge is a working proxy onto a paid residential
+/// exit, and loopback is shared with every other process on the machine (every
+/// app on Android, every user on a shared desktop).
 async fn serve_conn(
     mut client: TcpStream,
     transit: &SocksEndpoint,
     exit: &SocksEndpoint,
+    auth: &(String, String),
 ) -> Result<(), String> {
-    // Greeting: pick no-auth when offered.
+    // Greeting: username/password only.
     let mut hdr = [0u8; 2];
     read_step(&mut client, &mut hdr)
         .await
@@ -419,13 +466,21 @@ async fn serve_conn(
     read_step(&mut client, &mut methods)
         .await
         .map_err(|e| format!("client greeting: {e}"))?;
-    if !methods.contains(&0x00) {
+    if !methods.contains(&0x02) {
         let _ = client.write_all(&[0x05, 0xFF]).await;
-        return Err("client offered no no-auth method".to_string());
+        return Err("client offered no username/password method".to_string());
     }
-    write_step(&mut client, &[0x05, 0x00])
+    write_step(&mut client, &[0x05, 0x02])
         .await
         .map_err(|e| format!("client greeting reply: {e}"))?;
+    if let Err(e) = check_client_auth(&mut client, auth).await {
+        // A stray local process probing the port lands here.
+        let _ = client.write_all(&[0x01, 0x01]).await;
+        return Err(e);
+    }
+    write_step(&mut client, &[0x01, 0x00])
+        .await
+        .map_err(|e| format!("client auth reply: {e}"))?;
 
     // CONNECT request: [VER, CMD, RSV, ATYP, ADDR, PORT].
     let mut rhead = [0u8; 4];
@@ -502,6 +557,39 @@ async fn serve_conn(
 /// meaningless for a bridge and is filled with 0.0.0.0:0.
 async fn reply(client: &mut TcpStream, code: u8) -> Result<(), StageError> {
     write_step(client, &[0x05, code, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await
+}
+
+/// Read and verify the client's RFC 1929 username/password submission.
+/// Comparison is byte-wise on the whole pair; a mismatch is a hard failure
+/// (some other local process found the port).
+async fn check_client_auth(client: &mut TcpStream, auth: &(String, String)) -> Result<(), String> {
+    let mut head = [0u8; 2]; // [auth version, username length]
+    read_step(client, &mut head)
+        .await
+        .map_err(|e| format!("client auth: {e}"))?;
+    if head[0] != 0x01 {
+        return Err(format!(
+            "client auth version {:#04x}; only RFC 1929 (0x01) is supported",
+            head[0]
+        ));
+    }
+    let mut user = vec![0u8; head[1] as usize];
+    read_step(client, &mut user)
+        .await
+        .map_err(|e| format!("client auth username: {e}"))?;
+    let mut plen = [0u8; 1];
+    read_step(client, &mut plen)
+        .await
+        .map_err(|e| format!("client auth: {e}"))?;
+    let mut pass = vec![0u8; plen[0] as usize];
+    read_step(client, &mut pass)
+        .await
+        .map_err(|e| format!("client auth password: {e}"))?;
+    if user == auth.0.as_bytes() && pass == auth.1.as_bytes() {
+        Ok(())
+    } else {
+        Err("client presented wrong bridge credentials (another local process?)".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -654,14 +742,43 @@ mod tests {
         addr
     }
 
-    /// Minimal SOCKS5 client: no-auth greeting + domain CONNECT; returns the
-    /// CONNECT reply code (0 = success).
-    async fn socks5_connect(port: u16, host: &str, target_port: u16) -> u8 {
+    /// Minimal SOCKS5 client speaking username/password auth (what the bridge
+    /// now demands); returns the CONNECT reply code (0 = success).
+    async fn socks5_connect(handle: &BridgeHandle, host: &str, target_port: u16) -> u8 {
+        socks5_connect_as(
+            handle.port,
+            &handle.username,
+            &handle.password,
+            host,
+            target_port,
+        )
+        .await
+    }
+
+    /// Same, with explicit credentials — for the wrong-password case. Returns
+    /// 0xFF when the bridge rejected the auth before CONNECT.
+    async fn socks5_connect_as(
+        port: u16,
+        user: &str,
+        pass: &str,
+        host: &str,
+        target_port: u16,
+    ) -> u8 {
         let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        s.write_all(&[0x05, 0x01, 0x02]).await.unwrap();
         let mut gr = [0u8; 2];
         s.read_exact(&mut gr).await.unwrap();
-        assert_eq!(gr, [0x05, 0x00]);
+        assert_eq!(gr, [0x05, 0x02], "the bridge must demand password auth");
+        let mut auth = vec![0x01u8, user.len() as u8];
+        auth.extend_from_slice(user.as_bytes());
+        auth.push(pass.len() as u8);
+        auth.extend_from_slice(pass.as_bytes());
+        s.write_all(&auth).await.unwrap();
+        let mut ar = [0u8; 2];
+        s.read_exact(&mut ar).await.unwrap();
+        if ar[1] != 0x00 {
+            return 0xFF;
+        }
         let mut req = vec![0x05u8, 0x01, 0x00, 0x03];
         req.push(host.len() as u8);
         req.extend_from_slice(host.as_bytes());
@@ -743,7 +860,7 @@ mod tests {
             let (exit_addr, exit_seen) =
                 spawn_fake_socks(Some(("u-exit".into(), "p-exit".into())), Some(echo)).await;
             let (transit_addr, transit_seen) = spawn_fake_socks(None, None).await;
-            let port = spawn_bridge_ep(
+            let bridge = spawn_bridge_ep(
                 &endpoint(transit_addr, "", ""),
                 &endpoint(exit_addr, "u-exit", "p-exit"),
             )
@@ -751,7 +868,7 @@ mod tests {
 
             let client = reqwest::Client::builder()
                 .no_proxy()
-                .proxy(reqwest::Proxy::all(format!("socks5h://127.0.0.1:{port}")).unwrap())
+                .proxy(reqwest::Proxy::all(bridge.proxy_url()).unwrap())
                 .build()
                 .unwrap();
             let body = client
@@ -782,7 +899,7 @@ mod tests {
             let (exit_addr, _) =
                 spawn_fake_socks(Some(("u-exit".into(), "p-exit".into())), Some(echo)).await;
             let (transit_addr, _) = spawn_fake_socks(None, None).await;
-            let port = spawn_bridge_ep(
+            let bridge = spawn_bridge_ep(
                 &endpoint(transit_addr, "", ""),
                 &endpoint(exit_addr, "u-exit", "p-exit"),
             )
@@ -790,7 +907,7 @@ mod tests {
 
             let client = wreq::Client::builder()
                 .emulation(crate::channels::cookie::emulation())
-                .proxy(wreq::Proxy::all(format!("socks5h://127.0.0.1:{port}")).unwrap())
+                .proxy(wreq::Proxy::all(bridge.proxy_url()).unwrap())
                 .build()
                 .unwrap();
             let body = client
@@ -816,7 +933,7 @@ mod tests {
             let dead_port = dead.local_addr().unwrap().port();
             drop(dead);
             let (exit_addr, _) = spawn_fake_socks(None, None).await;
-            let port = spawn_bridge_ep(
+            let bridge = spawn_bridge_ep(
                 &SocksEndpoint {
                     host: "127.0.0.1".into(),
                     port: dead_port,
@@ -826,7 +943,7 @@ mod tests {
                 &endpoint(exit_addr, "", ""),
             )
             .unwrap();
-            let code = socks5_connect(port, "any.test", 80).await;
+            let code = socks5_connect(&bridge, "any.test", 80).await;
             assert_ne!(code, 0x00);
         })
         .await
@@ -840,13 +957,54 @@ mod tests {
             // The exit demands (u, p); the bridge is configured with (u, WRONG).
             let (exit_addr, _) = spawn_fake_socks(Some(("u".into(), "p".into())), Some(echo)).await;
             let (transit_addr, _) = spawn_fake_socks(None, None).await;
-            let port = spawn_bridge_ep(
+            let bridge = spawn_bridge_ep(
                 &endpoint(transit_addr, "", ""),
                 &endpoint(exit_addr, "u", "WRONG"),
             )
             .unwrap();
-            let code = socks5_connect(port, "any.test", 80).await;
+            let code = socks5_connect(&bridge, "any.test", 80).await;
             assert_ne!(code, 0x00);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    #[tokio::test]
+    async fn the_bridge_refuses_local_clients_without_its_credentials() {
+        // The bridge is a working proxy onto the paid residential exit, and
+        // loopback is shared with every other process on the machine (every
+        // app on Android). Wrong credentials must never reach the chain, and a
+        // no-auth greeting must be refused outright.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let echo = spawn_http_pong().await;
+            let (exit_addr, exit_seen) = spawn_fake_socks(None, Some(echo)).await;
+            let (transit_addr, _) = spawn_fake_socks(None, None).await;
+            let bridge = spawn_bridge_ep(
+                &endpoint(transit_addr, "", ""),
+                &endpoint(exit_addr, "", ""),
+            )
+            .unwrap();
+
+            // Wrong password: rejected at the auth step (0xFF sentinel).
+            let code =
+                socks5_connect_as(bridge.port, &bridge.username, "wrong", "any.test", 80).await;
+            assert_eq!(code, 0xFF, "wrong credentials must be rejected");
+
+            // No-auth greeting: refused with 0xFF (no acceptable method).
+            let mut s = TcpStream::connect(("127.0.0.1", bridge.port))
+                .await
+                .unwrap();
+            s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut gr = [0u8; 2];
+            s.read_exact(&mut gr).await.unwrap();
+            assert_eq!(gr, [0x05, 0xFF], "no-auth clients must be refused");
+
+            // Neither attempt reached the exit.
+            assert!(exit_seen.lock().unwrap().is_empty());
+
+            // The real credentials still work.
+            let code = socks5_connect(&bridge, "ok.test", 80).await;
+            assert_eq!(code, 0x00);
         })
         .await
         .expect("test timed out");
