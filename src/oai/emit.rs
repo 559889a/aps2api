@@ -19,13 +19,28 @@ fn map_finish_reason(reason: &str) -> &'static str {
     }
 }
 
+/// `usageMetadata` → OAI usage.
+///
+/// `completion_tokens` is candidatesTokenCount **plus** thoughtsTokenCount:
+/// thinking tokens are generated, billed, and counted inside totalTokenCount,
+/// so counting only the visible candidates made `prompt + completion` fall
+/// short of `total` on every thinking response (live sample 1/5/97/103) and
+/// understated cost for any client that adds the two up. The thought share is
+/// also reported separately in `completion_tokens_details.reasoning_tokens`,
+/// the shape OpenAI uses for reasoning models.
 fn map_usage(usage: &Value) -> Value {
     let pick = |k: &str| usage.get(k).and_then(Value::as_i64).unwrap_or(0);
-    json!({
+    let candidates = pick("candidatesTokenCount");
+    let thoughts = pick("thoughtsTokenCount");
+    let mut out = json!({
         "prompt_tokens": pick("promptTokenCount"),
-        "completion_tokens": pick("candidatesTokenCount"),
+        "completion_tokens": candidates + thoughts,
         "total_tokens": pick("totalTokenCount"),
-    })
+    });
+    if thoughts > 0 {
+        out["completion_tokens_details"] = json!({ "reasoning_tokens": thoughts });
+    }
+    out
 }
 
 /// Internal events -> wire output, in streaming or aggregated mode.
@@ -406,6 +421,39 @@ mod tests {
             "{joined}"
         );
         assert!(joined.contains("拦截"), "{joined}");
+        // The diagnosis is content, so it must follow a role chunk: this is
+        // the only path where nothing else triggered ensure_role.
+        let first = String::from_utf8_lossy(&end[0]).to_string();
+        assert!(
+            first.contains(r#""role":"assistant""#),
+            "the note must not be the first delta: {first}"
+        );
+    }
+
+    #[test]
+    fn usage_counts_thinking_tokens_as_completion() {
+        // Live express sample: 1 prompt / 5 candidates / 97 thoughts / 103
+        // total. Thinking tokens are generated and billed, and they are part
+        // of totalTokenCount — reporting only the 5 made prompt + completion
+        // disagree with total and understated the cost.
+        let u = map_usage(&json!({
+            "promptTokenCount": 1,
+            "candidatesTokenCount": 5,
+            "thoughtsTokenCount": 97,
+            "totalTokenCount": 103
+        }));
+        assert_eq!(u["prompt_tokens"], 1);
+        assert_eq!(u["completion_tokens"], 102);
+        assert_eq!(u["total_tokens"], 103);
+        assert_eq!(u["completion_tokens_details"]["reasoning_tokens"], 97);
+        // Non-thinking replies keep the plain shape (no details object).
+        let u = map_usage(&json!({
+            "promptTokenCount": 2,
+            "candidatesTokenCount": 3,
+            "totalTokenCount": 5
+        }));
+        assert_eq!(u["completion_tokens"], 3);
+        assert!(u.get("completion_tokens_details").is_none());
     }
 
     #[test]
