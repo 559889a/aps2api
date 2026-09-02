@@ -177,8 +177,13 @@ impl OaiEmitter {
             out.push(self.chunk_bytes(&json!({ "content": flushed }), None));
         }
         if !self.saw_content {
-            // No text/image at all: surface a diagnostic (§13.4).
+            // No text/image at all: surface a diagnostic (§13.4). The role
+            // chunk goes first — an OAI stream whose only content chunk
+            // arrives without a preceding `delta.role` is off-protocol, and
+            // this is the one path that could emit content before ensure_role
+            // ever ran.
             let note = self.empty_diagnosis();
+            self.ensure_role(&mut out);
             out.push(self.chunk_bytes(&json!({ "content": note }), None));
         }
         let finish = self.finish_reason.unwrap_or(if self.blocked_seen {
