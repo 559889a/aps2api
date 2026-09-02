@@ -106,6 +106,13 @@ pub struct CookieJar {
     /// down (spec §7.4). Demoted to false after the first write failure so
     /// a read-only directory cannot spam one WARN per response.
     persist: std::sync::atomic::AtomicBool,
+    /// Revision already written to disk. Doubles as the writer lock:
+    /// concurrent requests both rolling cookies used to call `fs::write` on
+    /// the same path at the same time, which can leave a torn file (and a
+    /// torn jar loses credentials on the next start). Holding this while
+    /// writing serializes the writers, and the stored revision lets a writer
+    /// skip its snapshot when a newer one already landed.
+    persisted_revision: Mutex<u64>,
 }
 
 impl CookieJar {
@@ -145,6 +152,7 @@ impl CookieJar {
             revision: AtomicU64::new(0),
             path,
             persist: std::sync::atomic::AtomicBool::new(persist),
+            persisted_revision: Mutex::new(0),
         }
     }
 
@@ -156,6 +164,7 @@ impl CookieJar {
             revision: AtomicU64::new(0),
             path: None,
             persist: std::sync::atomic::AtomicBool::new(false),
+            persisted_revision: Mutex::new(0),
         }
     }
 
@@ -193,10 +202,12 @@ impl CookieJar {
             }
         }
         if changed {
-            self.revision.fetch_add(1, Ordering::SeqCst);
+            // Revision and snapshot are taken under the jar lock, so the two
+            // always describe the same state and their order matches.
+            let revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
             let snapshot = jar.clone();
             drop(jar);
-            self.persist(&snapshot);
+            self.persist(&snapshot, revision);
         }
         changed
     }
@@ -207,25 +218,39 @@ impl CookieJar {
         self.revision.load(Ordering::SeqCst)
     }
 
-    fn persist(&self, jar: &BTreeMap<String, String>) {
+    fn persist(&self, jar: &BTreeMap<String, String>, revision: u64) {
         if !self.persist.load(Ordering::SeqCst) {
             return;
         }
         let Some(path) = &self.path else {
             return;
         };
+        let mut written = self.persisted_revision.lock().unwrap();
+        if *written >= revision {
+            return; // a newer snapshot already reached the disk
+        }
         let mut body = String::with_capacity(256);
         body.push_str("# aps2api cookie jar — runtime-rolled cookie values (spec §7.4).\n");
         body.push_str("# Human-editable; delete the file to reset to config.yaml's string.\n");
         for (name, value) in jar {
             body.push_str(&format!("{name}: {}\n", yaml_escape(value)));
         }
-        if let Err(e) = std::fs::write(path, body) {
-            // Demote persistence: one WARN total, then in-memory only — a
-            // read-only deployment directory must not log per response.
-            self.persist.store(false, Ordering::SeqCst);
-            tracing::warn!(path = %path.display(), error = %e,
-                "cannot persist cookie.jar.yaml (continuing in-memory, persistence disabled)");
+        // Write beside the target and rename over it: a reader (this process
+        // on the next start, or the owner) then sees either the old file or
+        // the new one, never a half-written jar. `rename` replaces the
+        // destination on all three target platforms.
+        let tmp = path.with_extension("yaml.tmp");
+        let outcome = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
+        match outcome {
+            Ok(()) => *written = revision,
+            Err(e) => {
+                // Demote persistence: one WARN total, then in-memory only — a
+                // read-only deployment directory must not log per response.
+                let _ = std::fs::remove_file(tmp);
+                self.persist.store(false, Ordering::SeqCst);
+                tracing::warn!(path = %path.display(), error = %e,
+                    "cannot persist cookie.jar.yaml (continuing in-memory, persistence disabled)");
+            }
         }
     }
 }
